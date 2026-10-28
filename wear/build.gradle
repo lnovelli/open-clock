@@ -1,0 +1,41 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.openclock'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.openclock'
+        minSdk 26
+        targetSdk 34
+        versionCode 11
+        versionName '2.0'
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    buildTypes { release { minifyEnabled false } }
+    sourceSets.main.java.srcDir layout.buildDirectory.dir('generated/watch-engine/java')
+    sourceSets.main.res.srcDir layout.buildDirectory.dir('generated/watch-engine/res')
+}
+
+// Compile exactly the same alarm engine as the phone without maintaining a fork.
+// Phone and watch have separate app storage and separate AlarmManager registrations.
+tasks.register('prepareWatchEngine', Sync) {
+    from('../app/src/main/java') {
+        include 'com/openclock/AlarmStore.java', 'com/openclock/AlarmTimes.java',
+                'com/openclock/AlarmReceiver.java', 'com/openclock/RestoreReceiver.java',
+                'com/openclock/AlarmNotifications.java', 'com/openclock/RingingService.java',
+                'com/openclock/ClockApplication.java'
+        into 'java'
+    }
+    from('../app/src/main/res') {
+        include 'drawable/ic_alarm.xml', 'raw/alarm_sound.wav'
+        into 'res'
+    }
+    into layout.buildDirectory.dir('generated/watch-engine')
+}
+tasks.named('preBuild').configure { dependsOn tasks.named('prepareWatchEngine') }
+
+dependencies {
+    implementation 'com.google.android.gms:play-services-wearable:18.2.0'
+    implementation 'androidx.wear:wear:1.3.0'
+
+}

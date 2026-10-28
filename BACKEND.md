@@ -4,7 +4,7 @@
 
 ## Data and edits
 
-- Create requires `hour` and `minute`. Defaults: enabled/sound/vibrate/snoozeEnabled true, snoozeMinutes 5, snoozeCount 3, vibrationPattern `basic`, empty label/days, null date/groupId. Edits merge omitted public fields; private input fields are ignored.
+- Create requires `hour` and `minute`. Defaults: enabled/vibrate/snoozeEnabled true, sound false, snoozeMinutes 5, snoozeCount 3, vibrationPattern `basic`, empty label/days, null date/groupId. Edits merge omitted public fields; private input fields are ignored.
 - Label, group, sound, vibration and snooze-configuration edits preserve **all** persisted runtime fields: pending generation/time, concrete one-shot date, consumed weekly occurrence, active session, pending snooze and its count. They do not replace or cancel the pending schedule, even while ringing/snoozed. Changing hour/minute/date/days/enabled deliberately resets the occurrence/session and schedules a fresh generation if enabled. Editing a fired one-shot's label does not re-enable or recreate it.
 - `snoozeCount: 0` means unlimited snoozes for that occurrence. Otherwise it counts successful snoozes, not the initial ring. Minutes: 1–1440; count: 0–1000. Snooze commits a replacement pending generation before removing the active session; failed persistence retains both prior controls and prior weekly schedule.
 - `vibrationPattern` is a string enum: `basic`, `pulse`, `heartbeat`. Missing legacy values read/default to `basic`; other supplied values are rejected. The alarm editor and external API expose this setting.
@@ -15,7 +15,7 @@
 ## Scheduling and reconciliation
 
 - Creating, enabling or changing an enabled schedule requires exact-alarm access, notification permission, app notifications enabled, and a High-importance ringing channel. No inexact fallback. Metadata edits, disabled saves, deletion and dismissal remain available without those permissions.
-- Public JSON includes `nextTriggerAt` (epoch milliseconds, 0 if no pending trigger) and `schedulingError` (text or null). `enabled` preserves user intent after permission-related restore failures and is not by itself proof of a registered schedule. Reads surface current permission failures.
+- Public JSON includes `nextTriggerAt` (epoch milliseconds, 0 if no pending trigger), `snoozedUntil` (epoch milliseconds, 0 if no snooze is pending), and `schedulingError` (text or null). A pending snooze may remain visible after registration fails. `enabled` preserves user intent after permission-related restore failures and is not by itself proof of a registered schedule. Reads surface current permission failures.
 - Exact alarm-clock PendingIntents carry ID+unique generation in both identity URI and extras. Fire/dismiss/snooze reload persisted generation/session; stale deliveries are harmless. New schedules are registered before atomic commit; failed persistence cancels only the tentative generation. Old schedules are canceled only after successful commit.
 - Reconciliation commits and retires replacements **one alarm at a time**, never staging a second complete schedule set. Unchanged future/due generations are reinstalled without token churn or unnecessary disk commits. An OS registration failure retains the original generation rather than canceling a potentially valid schedule, and surfaces an error.
 - A queued trigger already due by less than ten minutes retains its exact generation and occurrence. It is reinstalled for prompt delivery, not recomputed as tomorrow/next week. Older missed one-shots/snoozes expire rather than silently rolling over; older missed weekly occurrences advance to the next valid date. Ordinary delivery is subject to the same ten-minute catch-up limit.
@@ -46,7 +46,7 @@ The private alarm Activity supports lock-screen display without dismissing the s
 
 ## Manifest / IPC ownership
 
-Launcher: `com.openclock.MainActivity`. Exported receiver: `com.openclock.IntentApi`, action `com.openclock.API`, no private process. MainActivity, IntentApi, README and manifest were not edited by these reliability fixes. The standard `android.intent.action.SET_ALARM` filter is not advertised because IntentApi implements the separate ordered JSON protocol.
+Launcher: `com.openclock.MainActivity`. Since 1.3, the old exported ordered-broadcast receiver is removed; the separate authenticated JSON Binder service is `com.openclock.AccessService`. See README for the current transport and approval rules. The standard `android.intent.action.SET_ALARM` filter is not advertised.
 
 ## Verification boundaries and residual limitations
 

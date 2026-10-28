@@ -1,10 +1,6 @@
 package com.openclock;
 
-import android.app.Activity;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.os.Bundle;
 import android.util.JsonReader;
 import android.util.JsonToken;
 
@@ -19,68 +15,46 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
 
-/** Deliberately public IPC. Replies travel only through the ordered broadcast result. */
-public final class IntentApi extends BroadcastReceiver {
-    public static final String ACTION = "com.openclock.API";
-    public static final String EXTRA_REQUEST = "request";
-    public static final String EXTRA_RESULT = "result";
+/** JSON operation engine; it is not an Android component. */
+public final class IntentApi {
     private static final int MAX_REQUEST = 16384;
     private static final int MAX_RESULT = 200000;
 
-    @Override public void onReceive(Context context, Intent intent) {
-        // Never mutate for unordered sends: there would be no reliable error/result channel.
-        if (!isOrderedBroadcast()) return;
+    static final class Activity {
+        String operation=AccessLog.REQUEST;
+        String outcome="failed";
+    }
+
+    /** Called only after Binder authorization; never exposed as a receiver. */
+    static String execute(Context context, String raw, Activity activity) {
         JSONObject response;
-        int code = Activity.RESULT_CANCELED;
         try {
-            if (intent == null || !ACTION.equals(intent.getAction())) {
-                throw new ApiException("INVALID_ACTION", "Expected com.openclock.API");
-            }
-            Bundle extras = intent.getExtras();
-            if (extras == null || extras.size() != 1 || !extras.containsKey(EXTRA_REQUEST)
-                    || !(extras.get(EXTRA_REQUEST) instanceof String)) {
-                throw bad("Supply only the string extra request");
-            }
-            String raw = (String) extras.get(EXTRA_REQUEST);
-            if (raw.length() > MAX_REQUEST) throw bad("Request exceeds 16384 characters");
+            if (raw == null || raw.length() > MAX_REQUEST) throw bad("Request is null or exceeds 16384 characters");
             JSONObject request = parse(raw);
-            // Store also uses this monitor; validation + read/merge/write must be one operation.
-            // Synchronous completion preserves the ordered-broadcast result and operation order.
-            synchronized (AlarmStore.class) {
-                response = dispatch(context, request);
-            }
-            code = Activity.RESULT_OK;
+            activity.operation = AccessLog.operation(request.opt("op"));
+            synchronized (AlarmStore.class) { response = dispatch(context, request); }
         } catch (ApiException e) {
             response = error(e.code, e.getMessage());
         } catch (IOException e) {
-            // No empty-data fallback: a failed read/write must not become apparent success.
             response = error("STORAGE_ERROR", "Storage I/O failed; read back state before retrying a mutation");
         } catch (SecurityException e) {
             response = error("PERMISSION_DENIED", "Android denied an operation; review app permissions");
         } catch (IllegalArgumentException e) {
             response = error("INVALID_ARGUMENT", "The store rejected the supplied values");
         } catch (IllegalStateException e) {
-            // AlarmStore wraps unreadable I/O and malformed persisted JSON on reads.
-            // Classify by cause, never by potentially private exception text, and do
-            // not misclassify unrelated Android/service IllegalStateExceptions.
-            if (e.getCause() instanceof IOException || e.getCause() instanceof org.json.JSONException) {
+            if (e.getCause() instanceof IOException || e.getCause() instanceof org.json.JSONException)
                 response = error("STORAGE_ERROR", "Storage is unreadable; read back state before retrying a mutation");
-            } else {
-                response = error("INTERNAL_ERROR", "Operation failed; read back state before retrying a mutation");
-            }
+            else response = error("INTERNAL_ERROR", "Operation failed; read back state before retrying a mutation");
         } catch (Exception e) {
-            // Do not leak paths, labels, intent contents, or exception messages.
             response = error("INTERNAL_ERROR", "Operation failed; read back state before retrying a mutation");
         }
         String json = response.toString();
-        if (json.length() > MAX_RESULT) {
-            code = Activity.RESULT_CANCELED;
-            json = error("RESULT_TOO_LARGE", "Result exceeds 200000 characters").toString();
-        }
-        Bundle result = new Bundle();
-        result.putString(EXTRA_RESULT, json);
-        setResult(code, json, result);
+        if (json.length() > MAX_RESULT) return error("RESULT_TOO_LARGE", "Result exceeds 200000 characters").toString();
+        activity.outcome = response.optBoolean("ok", false) ? "success" : "failed";
+        return json;
     }
+
+    static String denied(String code, String message) { return error(code, message).toString(); }
 
     private static JSONObject dispatch(Context context, JSONObject r) throws Exception {
         String op = string(r, "op", 40, false);
@@ -105,7 +79,7 @@ public final class IntentApi extends BroadcastReceiver {
                 } else {
                     if (patch.has("id")) throw bad("New alarms must omit id");
                     alarm = new JSONObject().put("date", JSONObject.NULL).put("days", new JSONArray())
-                            .put("label", "").put("enabled", true).put("sound", true)
+                            .put("label", "").put("enabled", true).put("sound", false)
                             .put("vibrate", true).put("vibrationPattern", "basic").put("snoozeEnabled", true)
                             .put("snoozeMinutes", 5).put("snoozeCount", 3).put("groupId", JSONObject.NULL);
                 }

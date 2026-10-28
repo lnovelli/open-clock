@@ -17,6 +17,7 @@ public final class RingingService extends Service {
     private AudioManager audio;
     private AudioFocusRequest focus;
     private String playing="";
+    private long playingId=-1;
     private boolean vibrating, prepared, hasFocus;
     private String vibratingPattern="";
     private long nextFocusRetry, nextAudioRetry, audioGeneration, prepareDeadline;
@@ -54,7 +55,7 @@ public final class RingingService extends Service {
                     nm.notify("alarm:"+a.getLong("id"),11,AlarmNotifications.ringing(this,a)); shown.put(a.getLong("id"),session);
                 }
                 // Deterministic independent owners: lowest ID requesting each output.
-                if(a.optBoolean("sound")&&(sound==null||a.getLong("id")<sound.getLong("id"))) sound=a;
+                if(AlarmStore.requestsSound(a)&&(sound==null||a.getLong("id")<sound.getLong("id"))) sound=a;
                 if(a.optBoolean("vibrate")&&(vibration==null||a.getLong("id")<vibration.getLong("id"))) vibration=a;
             }
             for(Long id:new HashSet<>(shown.keySet())) if(!current.contains(id)) { nm.cancel("alarm:"+id,11); shown.remove(id); }
@@ -62,7 +63,7 @@ public final class RingingService extends Service {
             nm.notify(AlarmNotifications.SERVICE_ID,AlarmNotifications.summary(this,active.length()));
             if(!wake.isHeld()) wake.acquire(AlarmStore.RING_TIMEOUT+10_000);
             String token=sound==null?"":sound.getJSONObject("_active").getString("token");
-            if(!token.equals(playing)) { stopAudio(); playing=token; nextAudioRetry=0; }
+            if(!token.equals(playing)) { stopAudio(); playing=token; playingId=sound==null?-1:sound.getLong("id"); nextAudioRetry=0; }
             long elapsed=SystemClock.elapsedRealtime();
             if(player!=null&&!prepared&&elapsed>=prepareDeadline) stopAudio();
             if(sound!=null&&player==null&&elapsed>=nextAudioRetry) { nextAudioRetry=elapsed+5000; play(); }
@@ -84,14 +85,26 @@ public final class RingingService extends Service {
         return new long[]{0,600,400,0};
     }
     private void requestFocus() {
+        if(!currentSoundAllowed()) { stopAudio(); return; }
         nextFocusRetry=SystemClock.elapsedRealtime()+5000;
         try { hasFocus=audio.requestAudioFocus(focus)==AudioManager.AUDIOFOCUS_REQUEST_GRANTED; }
         catch(RuntimeException denied) { hasFocus=false; return; }
-        try { if(hasFocus&&player!=null&&prepared) player.start(); }
+        try { startPreparedAudio(); }
         catch(RuntimeException unavailable) { stopAudio(); }
+    }
+    private boolean currentSoundAllowed() {
+        JSONObject a=AlarmStore.active(this,playingId,playing);
+        return a!=null&&AlarmStore.requestsSound(a);
+    }
+    private void startPreparedAudio() {
+        // Re-read durable state at every async start boundary. A queued focus/prepared
+        // callback must not revive muted, dismissed, expired or replaced occurrences.
+        if(!currentSoundAllowed()) { stopAudio(); return; }
+        if(hasFocus&&player!=null&&prepared) player.start();
     }
     private void play() {
         try {
+            if(!currentSoundAllowed()) { stopAudio(); return; }
             AudioAttributes attrs=new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build();
             final long generation=++audioGeneration;
             focus=new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT).setAudioAttributes(attrs)
@@ -99,7 +112,7 @@ public final class RingingService extends Service {
                 .setOnAudioFocusChangeListener(change->{
                     if(generation!=audioGeneration) return;
                     hasFocus=change==AudioManager.AUDIOFOCUS_GAIN;
-                    try { if(player!=null&&prepared) { if(hasFocus) player.start(); else player.pause(); } }
+                    try { if(hasFocus) startPreparedAudio(); else if(player!=null&&prepared) player.pause(); }
                     catch(RuntimeException unavailable) { stopAudio(); }
                 },handler).build();
             requestFocus();
@@ -116,7 +129,7 @@ public final class RingingService extends Service {
             player.setOnPreparedListener(mp->{
                 if(mp!=player) return;
                 prepared=true;
-                try { if(hasFocus) mp.start(); } catch(RuntimeException unavailable) { stopAudio(); }
+                try { startPreparedAudio(); } catch(RuntimeException unavailable) { stopAudio(); }
             });
             player.setOnErrorListener((mp,what,extra)->{ if(mp!=player) return true; stopAudio(); AlarmNotifications.warning(this,"Alarm sound is unavailable. Use the visible alarm controls."); return true; });
             prepareDeadline=SystemClock.elapsedRealtime()+10_000;

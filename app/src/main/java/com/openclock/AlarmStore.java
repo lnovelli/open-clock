@@ -31,7 +31,8 @@ public final class AlarmStore {
             return new JSONObject(new String(data,java.nio.charset.StandardCharsets.UTF_8));
         } catch(Exception e) { throw new IllegalStateException("Alarm storage is unreadable; refusing to overwrite it",e); }
     }
-    private static void commit(Context c, JSONObject state) throws Exception {
+    private static void commit(Context c, JSONObject state) throws Exception { commit(c,state,0,0); }
+    private static void commit(Context c, JSONObject state,long expiresAt,long deadlineElapsed) throws Exception {
         // Install recovery BEFORE persistence: a committed active session must have a
         // platform-owned wakeup even if the process dies before service startup.
         JSONObject recoveryState=new JSONObject(state.toString());
@@ -52,11 +53,23 @@ public final class AlarmStore {
             // refuses another registration. Previously installed recovery remains.
             AlarmNotifications.warning(c,message(unavailable));
         }
+        // Register recovery before the durable mutation; watch's implementation is a no-op.
+        if(expiresAt!=0&&(System.currentTimeMillis()>expiresAt||android.os.SystemClock.elapsedRealtime()>deadlineElapsed))
+            throw new IllegalArgumentException("Request expired");
+        WearSync.beforeCommit(c);
+        state.put("_wearRevision", Math.addExact(state.optLong("_wearRevision", 0), 1));
+        if(state.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>2_000_000)
+            throw new IllegalStateException("Alarm storage limit reached");
         android.util.AtomicFile f=file(c); java.io.FileOutputStream stream=null;
         try {
             stream=f.startWrite(); stream.write(state.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            stream.flush(); stream.getFD().sync(); f.finishWrite(stream);
+            stream.flush(); stream.getFD().sync();
+            if(expiresAt!=0&&(System.currentTimeMillis()>expiresAt||android.os.SystemClock.elapsedRealtime()>deadlineElapsed))
+                throw new IllegalArgumentException("Request expired");
+            f.finishWrite(stream);
         } catch(Exception e) { if(stream!=null) f.failWrite(stream); throw new java.io.IOException("Could not persist alarm changes",e); }
+        try { WearSync.afterCommit(c); }
+        catch(RuntimeException ignored) { /* advisory sync cannot change alarm result */ }
     }
     static JSONObject find(JSONArray list, long id) {
         for (int i=0;i<list.length();i++) if (list.optJSONObject(i).optLong("id")==id) return list.optJSONObject(i);
@@ -73,6 +86,9 @@ public final class AlarmStore {
         for(String k:remove) out.remove(k);
         if(!out.has("vibrationPattern")) out.put("vibrationPattern","basic");
         out.put("nextTriggerAt", a.optLong("_nextAt",0));
+        // Expose pending snooze independently of the ordinary alarm time. Keep
+        // due/queued snoozes visible until fire, disable, or recovery clears them.
+        out.put("snoozedUntil", a.optBoolean("enabled") && !a.has("_active") ? a.optLong("_snoozeAt",0) : 0);
         out.put("schedulingError", a.opt("_error") == null ? JSONObject.NULL : a.opt("_error"));
         return out;
     }
@@ -91,6 +107,38 @@ public final class AlarmStore {
     public static synchronized JSONArray groups(Context c) {
         try { return new JSONArray(state(c).getJSONArray("groups").toString()); }
         catch(JSONException e) { throw new IllegalStateException(e); }
+    }
+    // A snapshot and its revision must come from the same synchronized store generation.
+    static synchronized JSONObject wearSnapshot(Context c) throws Exception {
+        JSONObject s=state(c); JSONArray ringing=new JSONArray(), rows=s.getJSONArray("alarms");
+        long now=System.currentTimeMillis();
+        for(int i=0;i<rows.length();i++) {
+            JSONObject alarm=rows.getJSONObject(i), session=alarm.optJSONObject("_active");
+            if(session!=null&&validSession(c,session,now)) ringing.put(new JSONObject()
+                .put("id",alarm.getLong("id")).put("token",session.getString("token"))
+                .put("startedAt",session.getLong("startedAt"))
+                .put("expiresAt",now+remainingSessionMillis(session))
+                .put("hour",alarm.getInt("hour")).put("minute",alarm.getInt("minute"))
+                .put("label",alarm.optString("label","")).put("sound",requestsSound(alarm))
+                .put("vibrate",alarm.optBoolean("vibrate")).put("canSnooze",canSnooze(alarm)));
+        }
+        return new JSONObject().put("revision",s.optLong("_wearRevision",0))
+            .put("updatedAt",now).put("alarms",alarms(c)).put("groups",groups(c)).put("active",ringing);
+    }
+    static synchronized void wearSetEnabled(Context c,long revision,long id,boolean enabled,long expiresAt) throws Exception {
+        if(System.currentTimeMillis()>expiresAt) throw new IllegalArgumentException("Request expired; refresh on watch");
+        JSONObject s=state(c);
+        if(s.optLong("_wearRevision",0)!=revision) throw new IllegalArgumentException("Phone changed; refresh on watch");
+        JSONObject a=find(s.getJSONArray("alarms"),id);
+        if(a==null) throw new IllegalArgumentException("Alarm no longer exists; refresh on watch");
+        if(a.optBoolean("enabled")!=enabled) saveAlarm(c,new JSONObject().put("id",id).put("enabled",enabled));
+    }
+    static synchronized void wearFinish(Context c,long id,String token,boolean snooze,long expiresAt) throws Exception {
+        if(System.currentTimeMillis()>expiresAt||active(c,id,token)==null)
+            throw new IllegalArgumentException("Alarm occurrence expired; refresh on watch");
+        finish(c,id,token,snooze);
+        try { c.getSystemService(NotificationManager.class).cancel("alarm:"+id,11); }
+        finally { refreshService(c); }
     }
     private static long integer(JSONObject a,String key,long def,long min,long max) throws Exception {
         if(!a.has(key)) return def;
@@ -120,7 +168,8 @@ public final class AlarmStore {
         if(!x.has("hour")||!x.has("minute")) throw new IllegalArgumentException("hour and minute are required");
         a.put("hour",integer(x,"hour",0,0,23)); a.put("minute",integer(x,"minute",0,0,59));
         a.put("label",text(x,"label","",200));
-        for(String key:new String[]{"enabled","sound","vibrate","snoozeEnabled"}) a.put(key,bool(x,key,true));
+        for(String key:new String[]{"enabled","sound","vibrate","snoozeEnabled"})
+            a.put(key,bool(x,key,!"sound".equals(key)));
         a.put("snoozeMinutes",integer(x,"snoozeMinutes",5,1,1440));
         a.put("snoozeCount",integer(x,"snoozeCount",3,0,1000));
         String date=null;
@@ -151,7 +200,44 @@ public final class AlarmStore {
         return a;
     }
     public static synchronized JSONObject saveAlarm(Context c, JSONObject input) throws Exception {
+        return saveAlarmInternal(c,input,null,null,0,0);
+    }
+    // The receipt and alarm share one AtomicFile commit. Receipts are never evicted:
+    // forgetting an ID would make replay unsafe, including after clock changes.
+    static synchronized JSONObject wearCreate(Context c, JSONObject input, String node, String requestId, long expiresAt, long deadlineElapsed) throws Exception {
+        JSONObject receipt=wearCreateReceipt(c,node,requestId);
+        if(receipt!=null) return receipt;
+        if(System.currentTimeMillis()>expiresAt) throw new IllegalArgumentException("Request expired");
+        return saveAlarmInternal(c,input,node,requestId,expiresAt,deadlineElapsed);
+    }
+    static synchronized JSONObject wearCreateReceipt(Context c,String node,String requestId) throws Exception {
+        JSONArray receipts=state(c).optJSONArray("_wearCreates");
+        if(receipts!=null) for(int i=0;i<receipts.length();i++) {
+            JSONObject r=receipts.getJSONObject(i);
+            if(node.equals(r.optString("node"))&&requestId.equals(r.optString("requestId"))) return new JSONObject(r.toString());
+        }
+        return null;
+    }
+    static final class WearReceiptCapacityException extends IllegalStateException {
+        WearReceiptCapacityException() { super("Wear receipt capacity reached"); }
+    }
+    private static JSONObject saveAlarmInternal(Context c, JSONObject input, String node, String requestId, long expiresAt,long deadlineElapsed) throws Exception {
+        return saveAlarmInternal(c,input,node,requestId,expiresAt,deadlineElapsed,null,-1);
+    }
+    private static JSONObject saveAlarmInternal(Context c, JSONObject input, String node, String requestId, long expiresAt,long deadlineElapsed,String epoch,long expectedRevision) throws Exception {
         JSONObject s=state(c); JSONArray as=s.getJSONArray("alarms");
+        boolean mutation=epoch!=null;
+        if(mutation&&s.optLong("_wearRevision",0)!=expectedRevision) throw new IllegalArgumentException("Phone changed");
+        JSONArray receipts=null;
+        if(requestId!=null) {
+            String key=mutation?"_wearMutations":"_wearCreates";
+            receipts=s.optJSONArray(key);
+            if(receipts==null) { receipts=new JSONArray(); s.put(key,receipts); }
+            if(receipts.length()>=4096) {
+                if(mutation) throw new WearReceiptCapacityException();
+                throw new IllegalStateException("Wear receipt limit reached");
+            }
+        }
         boolean edit=input.has("id"); long id=edit?integer(input,"id",0,1,Long.MAX_VALUE):s.getLong("nextId");
         JSONObject old=find(as,id); if(edit&&old==null) throw new IllegalArgumentException("Alarm does not exist");
         if(!edit&&as.length()>=500) throw new IllegalArgumentException("Alarm limit reached");
@@ -170,9 +256,132 @@ public final class AlarmStore {
             }
         }
         if(edit) as.put(index(as,id),a); else { as.put(a); s.put("nextId",id+1); }
-        try { commit(c,s); } catch(Exception e) { if(changed) cancel(c,a); throw e; }
+        JSONObject receipt=null;
+        try {
+            if(receipts!=null) {
+                if(edit!=mutation||System.currentTimeMillis()>expiresAt) throw new IllegalArgumentException("Request expired");
+                receipt=new JSONObject().put("node",node).put("requestId",requestId).put("alarmId",id)
+                    .put("revision",Math.addExact(s.optLong("_wearRevision",0),1));
+                if(mutation) {
+                    JSONObject patch=new JSONObject(input.toString()); patch.remove("id");
+                    receipt.put("epoch",epoch).put("op","edit").put("baseRevision",expectedRevision)
+                        .put("fingerprint",wearMutationFingerprint("edit",id,expectedRevision,patch));
+                }
+                receipts.put(receipt);
+                // Keep idempotency receipts from crowding out future alarm state,
+                // including active sessions, snoozes and ordinary phone edits.
+                // Never evict receipts: a delayed/replayed create could duplicate.
+                if(receipts.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>256_000 ||
+                        s.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>1_000_000) {
+                    if(mutation) throw new WearReceiptCapacityException();
+                    throw new IllegalStateException("Wear creation receipt capacity reached");
+                }
+            }
+            commit(c,s,receipts==null?0:expiresAt,receipts==null?0:deadlineElapsed);
+        } catch(Exception e) { if(changed) cancel(c,a); throw e; }
         if(changed&&old!=null) cancel(c,old);
-        refreshService(c); return publicAlarm(a);
+        refreshService(c); return receipt==null?publicAlarm(a):receipt;
+    }
+    /** Strict public-field allowlist; never accept runtime fields from a peer. */
+    static void validateWearPatch(JSONObject patch) throws Exception {
+        if(patch==null||patch.length()==0||patch.length()>13) throw new IllegalArgumentException("Empty or invalid patch");
+        Iterator<String> keys=patch.keys();
+        while(keys.hasNext()) {
+            String k=keys.next(); Object v=patch.get(k);
+            switch(k) {
+                case "hour": integer(patch,k,0,0,23); break;
+                case "minute": integer(patch,k,0,0,59); break;
+                case "snoozeMinutes": integer(patch,k,0,1,1440); break;
+                case "snoozeCount": integer(patch,k,0,0,1000); break;
+                case "groupId": if(v!=JSONObject.NULL) integer(patch,k,0,1,Long.MAX_VALUE); break;
+                case "enabled": case "sound": case "vibrate": case "snoozeEnabled":
+                    if(!(v instanceof Boolean)) throw new IllegalArgumentException("Invalid boolean"); break;
+                case "label":
+                    if(!(v instanceof String)||((String)v).length()>200||!v.equals(((String)v).trim())) throw new IllegalArgumentException("Invalid label");
+                    String label=(String)v;
+                    for(int i=0;i<label.length();i++) {
+                        char ch=label.charAt(i);
+                        if(Character.isHighSurrogate(ch)) {
+                            if(++i>=label.length()||!Character.isLowSurrogate(label.charAt(i))) throw new IllegalArgumentException("Invalid label text");
+                        } else if(Character.isLowSurrogate(ch)) throw new IllegalArgumentException("Invalid label text");
+                    } break;
+                case "date":
+                    if(v!=JSONObject.NULL) { if(!(v instanceof String)) throw new IllegalArgumentException("Invalid date"); AlarmTimes.parseDate((String)v); } break;
+                case "vibrationPattern":
+                    if(!(v instanceof String)||!Arrays.asList("basic","pulse","heartbeat").contains(v)) throw new IllegalArgumentException("Invalid pattern"); break;
+                case "days":
+                    if(!(v instanceof JSONArray)||((JSONArray)v).length()>7) throw new IllegalArgumentException("Invalid days");
+                    Set<Long> days=new HashSet<>(); JSONArray arr=(JSONArray)v;
+                    for(int i=0;i<arr.length();i++) {
+                        Object d=arr.get(i); if(!(d instanceof Integer||d instanceof Long)) throw new IllegalArgumentException("Invalid day");
+                        long day=((Number)d).longValue(); if(day<1||day>7||!days.add(day)) throw new IllegalArgumentException("Invalid day");
+                    } break;
+                default: throw new IllegalArgumentException("Unknown field");
+            }
+            if(Arrays.asList("hour","minute","snoozeMinutes","snoozeCount","groupId").contains(k)&&v!=JSONObject.NULL&&!(v instanceof Integer||v instanceof Long))
+                throw new IllegalArgumentException("Invalid integer");
+        }
+    }
+    static String wearMutationFingerprint(String op,long id,long revision,JSONObject patch) throws Exception {
+        java.io.ByteArrayOutputStream bytes=new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream out=new java.io.DataOutputStream(bytes);
+        out.writeUTF(op); out.writeLong(id); out.writeLong(revision);
+        if(patch==null) out.writeInt(-1);
+        else {
+            List<String> keys=new ArrayList<>(); Iterator<String> it=patch.keys(); while(it.hasNext()) keys.add(it.next());
+            Collections.sort(keys); out.writeInt(keys.size());
+            for(String key:keys) {
+                Object value=patch.get(key); out.writeUTF(key);
+                if(value==JSONObject.NULL) out.writeByte(0);
+                else if(value instanceof String) { out.writeByte(1); out.writeUTF((String)value); }
+                else if(value instanceof Boolean) { out.writeByte(2); out.writeBoolean((Boolean)value); }
+                else if(value instanceof Integer||value instanceof Long) { out.writeByte(3); out.writeLong(((Number)value).longValue()); }
+                else if(value instanceof JSONArray) {
+                    JSONArray arr=(JSONArray)value; out.writeByte(4); out.writeInt(arr.length());
+                    for(int i=0;i<arr.length();i++) out.writeLong(((Number)arr.get(i)).longValue());
+                } else throw new IllegalArgumentException("Invalid fingerprint field");
+            }
+        }
+        out.flush(); byte[] digest=java.security.MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
+        StringBuilder hex=new StringBuilder(); for(byte b:digest) hex.append(String.format(Locale.ROOT,"%02x",b&255)); return hex.toString();
+    }
+    static synchronized JSONObject wearMutationReceipt(Context c,String node,String epoch,String requestId) throws Exception {
+        JSONArray rows=state(c).optJSONArray("_wearMutations");
+        if(rows!=null) for(int i=0;i<rows.length();i++) {
+            JSONObject r=rows.getJSONObject(i);
+            if(node.equals(r.optString("node"))&&epoch.equals(r.optString("epoch"))&&requestId.equals(r.optString("requestId"))) return new JSONObject(r.toString());
+        }
+        return null;
+    }
+    static synchronized JSONObject wearMutation(Context c,String node,String epoch,String requestId,String op,long id,long revision,JSONObject patch,long expiresAt,long deadlineElapsed) throws Exception {
+        JSONObject prior=wearMutationReceipt(c,node,epoch,requestId);
+        if(prior!=null) {
+            if(!op.equals(prior.optString("op"))||id!=prior.optLong("alarmId")||
+                revision!=prior.optLong("baseRevision",-1)||!wearMutationFingerprint(op,id,revision,patch).equals(prior.optString("fingerprint")))
+                throw new IllegalArgumentException("Conflicting request");
+            return prior;
+        }
+        if(id<1||revision<0||System.currentTimeMillis()>expiresAt||android.os.SystemClock.elapsedRealtime()>deadlineElapsed) throw new IllegalArgumentException("Expired");
+        if("edit".equals(op)) {
+            validateWearPatch(patch);
+            JSONObject input=new JSONObject(patch.toString()).put("id",id);
+            return saveAlarmInternal(c,input,node,requestId,expiresAt,deadlineElapsed,epoch,revision);
+        }
+        if(!"delete".equals(op)||patch!=null) throw new IllegalArgumentException("Invalid operation");
+        JSONObject s=state(c); JSONArray as=s.getJSONArray("alarms");
+        if(s.optLong("_wearRevision",0)!=revision) throw new IllegalArgumentException("Phone changed");
+        JSONObject old=find(as,id); if(old==null) throw new IllegalArgumentException("Alarm no longer exists");
+        JSONArray receipts=s.optJSONArray("_wearMutations");
+        if(receipts==null) { receipts=new JSONArray(); s.put("_wearMutations",receipts); }
+        if(receipts.length()>=4096) throw new WearReceiptCapacityException();
+        as.remove(index(as,id));
+        JSONObject receipt=new JSONObject().put("node",node).put("epoch",epoch).put("requestId",requestId)
+            .put("op","delete").put("alarmId",id).put("baseRevision",revision)
+            .put("fingerprint",wearMutationFingerprint("delete",id,revision,null)).put("revision",Math.addExact(revision,1));
+        receipts.put(receipt);
+        if(receipts.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>256_000||
+            s.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>1_000_000) throw new WearReceiptCapacityException();
+        commit(c,s,expiresAt,deadlineElapsed); cancel(c,old); refreshService(c); return receipt;
     }
     public static synchronized void deleteAlarm(Context c,long id) throws Exception {
         JSONObject s=state(c); JSONArray as=s.getJSONArray("alarms"); JSONObject old=find(as,id);
@@ -370,19 +579,48 @@ public final class AlarmStore {
         JSONArray as=active(c); JSONObject a=find(as,id);
         return a!=null&&token.equals(a.optJSONObject("_active").optString("token"))?a:null;
     }
+    /** A mute belongs to the active token, never to the alarm's saved sound setting. */
+    static boolean requestsSound(JSONObject a) {
+        JSONObject session=a.optJSONObject("_active");
+        return session!=null&&a.optBoolean("sound")&&!session.optBoolean("soundMuted");
+    }
+    /** Validate the visible occurrence before atomically muting every currently ringing session.
+     * Later fires (including snoozes) create fresh _active objects and remain audible.
+     */
+    static synchronized boolean muteCurrent(Context c,long id,String token) throws Exception {
+        JSONObject s=state(c); JSONArray as=s.getJSONArray("alarms");
+        JSONObject anchor=find(as,id), session=anchor==null?null:anchor.optJSONObject("_active");
+        long now=System.currentTimeMillis();
+        if(token==null||session==null||!token.equals(session.optString("token"))||!validSession(c,session,now)) return false;
+        boolean dirty=false;
+        for(int i=0;i<as.length();i++) {
+            JSONObject current=as.getJSONObject(i).optJSONObject("_active");
+            if(current!=null&&validSession(c,current,now)&&!current.optBoolean("soundMuted")) {
+                current.put("soundMuted",true); dirty=true;
+            }
+        }
+        if(dirty) commit(c,s);
+        refreshService(c); return true;
+    }
     static boolean canSnooze(JSONObject a) {
         JSONObject active=a.optJSONObject("_active");
         return active!=null&&a.optBoolean("snoozeEnabled")&&(a.optInt("snoozeCount")==0||active.optInt("snoozeUsed")<a.optInt("snoozeCount"));
     }
     static synchronized void finish(Context c,long id,String token,boolean snooze) throws Exception {
+        finish(c,id,token,snooze,null);
+    }
+    /** A UI-selected interval applies only to this snooze, not the saved alarm setting. */
+    static synchronized void finish(Context c,long id,String token,boolean snooze,Integer minutesOverride) throws Exception {
         JSONObject s=state(c); JSONObject a=find(s.getJSONArray("alarms"),id);
         if(a==null||!a.has("_active")||!token.equals(a.getJSONObject("_active").optString("token"))) return;
         JSONObject old=new JSONObject(a.toString());
         if(snooze&&!canSnooze(a)) throw new IllegalArgumentException("Snooze limit reached");
         if(snooze) {
+            int minutes=minutesOverride==null?a.getInt("snoozeMinutes"):minutesOverride;
+            if(minutes<1||minutes>1440) throw new IllegalArgumentException("Snooze must be between 1 and 1440 minutes");
             requireAccess(c);
             a.put("_snoozeUsed",a.getJSONObject("_active").optInt("snoozeUsed")+1);
-            a.put("_snoozeAt",System.currentTimeMillis()+a.getLong("snoozeMinutes")*60_000L);
+            a.put("_snoozeAt",System.currentTimeMillis()+minutes*60_000L);
             prepare(c,a,System.currentTimeMillis());
         } else if(a.getJSONArray("days").length()==0) a.put("enabled",false);
         a.remove("_active");

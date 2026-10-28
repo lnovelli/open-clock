@@ -9,7 +9,9 @@ import android.app.NotificationManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -19,12 +21,17 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.text.InputFilter;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowInsets;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.content.Context;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.NumberPicker;
 import android.widget.PopupMenu;
@@ -46,13 +53,17 @@ import java.util.Set;
 
 /** Alarm-only interface. Persistence and scheduling are exclusively owned by AlarmStore. */
 public class MainActivity extends Activity {
-    private static final int BG = 0xfff0f3f9, WHITE = 0xffffffff, INK = 0xff202635;
-    private static final int MUTED = 0xff737d90, BLUE = 0xff365ee9, SOFT = 0xffe6ecff;
-    private static final int OFF = 0xffa4acba, RED = 0xffba354a;
+    // Resolved once per activity: Android recreates it when the system night mode changes.
+    private int BG, WHITE, INK, MUTED, BLUE, SOFT, OFF, RED, ON_BLUE;
+    private int GROUP, SUCCESS, TRACK_ON, TRACK_OFF, RIPPLE, RIPPLE_SUBTLE, RIPPLE_ON_BLUE;
+    private boolean night;
     private LinearLayout root, body;
     private ScrollView scroller;
     private String screen = "home";
+    private int homeScrollY;
+    private ScrollView homeRestoreTarget;
     private JSONObject draft;
+    private String alarmBaseline;
     private NumberPicker hourPicker, minutePicker;
     private EditText labelInput;
     private Switch enabledSwitch, soundSwitch, vibrationSwitch, snoozeSwitch;
@@ -61,23 +72,50 @@ public class MainActivity extends Activity {
     private final Set<Long> collapsed = new HashSet<>();
     private long groupEditorId = -1;
     private EditText groupName;
+    private String groupBaseline;
     private final ArrayList<CheckBox> memberChecks = new ArrayList<>();
     private final ArrayList<Long> memberIds = new ArrayList<>();
     private String lastPermissionState;
+    private static java.lang.ref.WeakReference<MainActivity> visibleHome = new java.lang.ref.WeakReference<>(null);
+    private static final java.util.concurrent.atomic.AtomicBoolean homeRefreshPending = new java.util.concurrent.atomic.AtomicBoolean();
+
+    @Override protected void onStart() {
+        super.onStart(); visibleHome = new java.lang.ref.WeakReference<>(this);
+    }
+    @Override protected void onStop() {
+        if (visibleHome.get() == this) visibleHome.clear();
+        super.onStop();
+    }
+    // In-process only: external apps cannot inject a UI invalidation broadcast.
+    static void wearChanged() {
+        if (!homeRefreshPending.compareAndSet(false, true)) return;
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            homeRefreshPending.set(false);
+            MainActivity a = visibleHome.get();
+            if (a == null || a.isFinishing() || !"home".equals(a.screen)) return;
+            a.showHome();
+        });
+    }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        initColors();
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-                | (Build.VERSION.SDK_INT >= 26 ? View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR : 0));
+        View decor = getWindow().getDecorView();
+        int lightBars = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                | (Build.VERSION.SDK_INT >= 26 ? View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR : 0);
+        int visibility = decor.getSystemUiVisibility();
+        decor.setSystemUiVisibility(night ? visibility & ~lightBars : visibility | lightBars);
         if (state != null) {
+            homeScrollY = state.getInt("homeScrollY", 0);
             long[] closed = state.getLongArray("collapsed");
             if (closed != null) for (long id : closed) collapsed.add(id);
             String previous = state.getString("screen", "home");
             try {
                 if ("alarm".equals(previous)) {
                     draft = new JSONObject(state.getString("draft", "{}"));
+                    alarmBaseline = state.getString("alarmBaseline", alarmSnapshot(draft));
                     showAlarmEditor();
                     return;
                 }
@@ -88,12 +126,34 @@ public class MainActivity extends Activity {
                     Set<Long> checked = new HashSet<>();
                     if (members != null) for (long id : members) checked.add(id);
                     for (int i = 0; i < memberChecks.size(); i++) memberChecks.get(i).setChecked(checked.contains(memberIds.get(i)));
+                    groupBaseline = state.getString("groupBaseline", groupBaseline);
                     return;
                 }
                 if ("permissions".equals(previous)) { showPermissions(); return; }
             } catch (Exception e) { /* Fall back to the list if saved editor state is invalid. */ }
         }
         showHome();
+    }
+
+    private void initColors() {
+        night = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                == Configuration.UI_MODE_NIGHT_YES;
+        BG = night ? 0xff121722 : 0xfff0f3f9;
+        WHITE = night ? 0xff1e2635 : 0xffffffff; // Card surface, not text on a primary button.
+        INK = night ? 0xffe9edf7 : 0xff202635;
+        MUTED = night ? 0xffb5c0d4 : 0xff737d90;
+        BLUE = night ? 0xffaabeff : 0xff365ee9;
+        SOFT = night ? 0xff283451 : 0xffe6ecff;
+        OFF = night ? 0xff9eaac0 : 0xffa4acba;
+        RED = night ? 0xffff9aaa : 0xffba354a;
+        ON_BLUE = night ? 0xff172348 : 0xffffffff;
+        GROUP = night ? 0xff293244 : 0xffe8edf7;
+        SUCCESS = night ? 0xff85d5ac : 0xff27765a;
+        TRACK_ON = night ? 0xff667bb5 : 0xffaabcf9;
+        TRACK_OFF = night ? 0xff4b566b : 0xffdae0eb;
+        RIPPLE = night ? 0x33a8bcff : 0x22365ee9;
+        RIPPLE_SUBTLE = night ? 0x20a8bcff : 0x15365ee9;
+        RIPPLE_ON_BLUE = night ? 0x33172348 : 0x33ffffff;
     }
 
     @Override protected void onResume() {
@@ -112,6 +172,8 @@ public class MainActivity extends Activity {
 
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
+        rememberHomeScroll();
+        state.putInt("homeScrollY", homeScrollY);
         state.putString("screen", screen);
         long[] closed = new long[collapsed.size()];
         int p = 0;
@@ -120,9 +182,11 @@ public class MainActivity extends Activity {
         if ("alarm".equals(screen) && draft != null) {
             captureAlarm();
             state.putString("draft", draft.toString());
+            state.putString("alarmBaseline", alarmBaseline);
         } else if ("group".equals(screen)) {
             state.putLong("groupId", groupEditorId);
             state.putString("groupName", groupName.getText().toString());
+            state.putString("groupBaseline", groupBaseline);
             ArrayList<Long> checked = new ArrayList<>();
             for (int i = 0; i < memberChecks.size(); i++) if (memberChecks.get(i).isChecked()) checked.add(memberIds.get(i));
             long[] ids = new long[checked.size()];
@@ -132,6 +196,7 @@ public class MainActivity extends Activity {
     }
 
     private void base(String mode) {
+        rememberHomeScroll();
         screen = mode;
         root = column();
         root.setBackgroundColor(BG);
@@ -178,6 +243,7 @@ public class MainActivity extends Activity {
                 PopupMenu popup = new PopupMenu(this, menu);
                 popup.getMenu().add("Create group").setOnMenuItemClickListener(item -> { showGroupEditor(-1); return true; });
                 popup.getMenu().add("Alarm permissions").setOnMenuItemClickListener(item -> { showPermissions(); return true; });
+                popup.getMenu().add("Apps & access").setOnMenuItemClickListener(item -> { startActivity(new Intent(this, AccessActivity.class)); return true; });
                 popup.show();
             });
             row.addView(menu, new LinearLayout.LayoutParams(dp(48), dp(48)));
@@ -189,6 +255,11 @@ public class MainActivity extends Activity {
         base("home");
         header("Alarm", false, v -> newAlarm());
         scrollBody();
+        ScrollView target = scroller;
+        homeRestoreTarget = target;
+        target.setOnScrollChangeListener((View v, int x, int y, int oldX, int oldY) -> {
+            if (scroller == target && homeRestoreTarget != target && "home".equals(screen)) homeScrollY = y;
+        });
         if (!exactAllowed() || !notificationsAllowed() || !fullScreenAllowed()) {
             LinearLayout note = card(SOFT, 20);
             TextView title = text(!exactAllowed() ? "Allow precise alarms" : !notificationsAllowed() ? "Allow alarm notifications" : "Show alarms on the lock screen", 16, BLUE);
@@ -213,7 +284,7 @@ public class MainActivity extends Activity {
                 JSONObject a = alarms.optJSONObject(j);
                 if (a != null && !a.isNull("groupId") && a.optLong("groupId") == id) members.add(a);
             }
-            LinearLayout container = card(0xffe8edf7, 18);
+            LinearLayout container = card(GROUP, 18);
             LinearLayout heading = row();
             LinearLayout names = column();
             TextView name = text(group.optString("name", "Group"), 20, INK);
@@ -225,7 +296,16 @@ public class MainActivity extends Activity {
             count.setPadding(0, dp(4), 0, 0);
             names.addView(count);
             heading.addView(names, new LinearLayout.LayoutParams(0, -2, 1));
-            TextView fold = icon(collapsed.contains(id) ? "⌄" : "⌃", "Expand or collapse " + group.optString("name"), v -> {
+            boolean isCollapsed = collapsed.contains(id);
+            ImageView fold = new ImageView(this);
+            fold.setImageResource(R.drawable.ic_group_chevron);
+            if (night) fold.setImageTintList(ColorStateList.valueOf(MUTED));
+            fold.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+            fold.setPadding(dp(12), dp(12), dp(12), dp(12));
+            fold.setRotation(isCollapsed ? 0f : 180f);
+            fold.setContentDescription((isCollapsed ? "Expand " : "Collapse ") + group.optString("name"));
+            fold.setBackground(new RippleDrawable(ColorStateList.valueOf(RIPPLE), null, round(WHITE, 24)));
+            fold.setOnClickListener(v -> {
                 if (!collapsed.remove(id)) collapsed.add(id);
                 showHome();
             });
@@ -234,7 +314,7 @@ public class MainActivity extends Activity {
             container.addView(heading);
             names.setOnClickListener(v -> { if (!collapsed.remove(id)) collapsed.add(id); showHome(); });
             if (!collapsed.contains(id)) {
-                for (JSONObject alarm : members) addBlock(container, alarmCard(alarm), 0, 12);
+                for (JSONObject alarm : members) addBlock(container, alarmCard(alarm), 0, 8);
                 if (members.isEmpty()) {
                     TextView empty = text("No alarms yet · Add or assign an alarm", 14, MUTED);
                     empty.setPadding(0, dp(18), 0, dp(6));
@@ -257,7 +337,7 @@ public class MainActivity extends Activity {
                 body.addView(heading);
                 ungroupedHeading = true;
             }
-            addBlock(body, alarmCard(alarm), 14);
+            addBlock(body, alarmCard(alarm), 8);
         }
         if (alarms.length() == 0 && groups.length() == 0) {
             LinearLayout empty = card(WHITE, 28);
@@ -280,35 +360,75 @@ public class MainActivity extends Activity {
         addGroup.setMinHeight(dp(56));
         addGroup.setOnClickListener(v -> showGroupEditor(-1));
         body.addView(addGroup);
+        // Restore only after measurement, so ScrollView clamps against the new content,
+        // not an unlaid-out (zero-height) child. Ignore callbacks from superseded views.
+        target.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            @Override public boolean onPreDraw() {
+                if (target.getViewTreeObserver().isAlive()) target.getViewTreeObserver().removeOnPreDrawListener(this);
+                if (scroller == target && homeRestoreTarget == target && "home".equals(screen)) {
+                    target.scrollTo(0, homeScrollY);
+                    homeRestoreTarget = null;
+                    homeScrollY = target.getScrollY();
+                }
+                return true;
+            }
+        });
+    }
+
+    private void rememberHomeScroll() {
+        // A refresh can arrive before the previous restoration is laid out; in that
+        // case retain the requested position rather than capturing its temporary zero.
+        if ("home".equals(screen) && scroller != null && scroller != homeRestoreTarget) {
+            homeScrollY = scroller.getScrollY();
+        }
     }
 
     private View alarmCard(JSONObject alarm) {
         boolean enabled = alarm.optBoolean("enabled", true);
-        LinearLayout card = card(WHITE, 21);
+        SwipeAlarmCard card = new SwipeAlarmCard(alarm);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(round(WHITE, 26));
+        card.setPadding(dp(16), dp(10), dp(16), dp(10));
         LinearLayout top = row();
         LinearLayout info = column();
-        TextView time = text(String.format(Locale.getDefault(), "%02d:%02d", alarm.optInt("hour"), alarm.optInt("minute")), 49, enabled ? INK : OFF);
-        time.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
+        TextView time = text(String.format(Locale.getDefault(), "%02d:%02d", alarm.optInt("hour"), alarm.optInt("minute")), 34, enabled ? INK : OFF);
+        time.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
         time.setFontFeatureSettings("tnum");
         time.setMaxLines(1);
-        time.setAutoSizeTextTypeUniformWithConfiguration(26, 49, 1, android.util.TypedValue.COMPLEX_UNIT_SP);
+        time.setAutoSizeTextTypeUniformWithConfiguration(24, 34, 1, android.util.TypedValue.COMPLEX_UNIT_SP);
         info.addView(time);
         String label = alarm.optString("label", "").trim();
-        if (!label.isEmpty()) {
-            TextView labelView = text(label, 16, enabled ? INK : OFF);
-            labelView.setPadding(dp(2), dp(2), 0, dp(3));
-            info.addView(labelView);
-        }
-        TextView schedule = text(scheduleText(alarm), 13, enabled ? MUTED : OFF);
-        schedule.setPadding(dp(2), dp(5), dp(8), dp(2));
+        String description = scheduleText(alarm);
+        TextView schedule = text(label.isEmpty() ? description : label + " · " + description, 13, enabled ? MUTED : OFF);
+        schedule.setPadding(dp(2), dp(3), dp(8), 0);
+        schedule.setMaxLines(2);
+        schedule.setEllipsize(android.text.TextUtils.TruncateAt.END);
         info.addView(schedule);
+        // The store owns this pending occurrence; don't hide it merely because its
+        // deadline has passed while delivery is queued or the device is busy.
+        long snoozedUntil = alarm.optLong("snoozedUntil", 0);
+        String snoozeDescription = "";
+        if (snoozedUntil > 0) {
+            snoozeDescription = "Snoozed until " + new SimpleDateFormat("HH:mm · EEE, d MMM yyyy", Locale.getDefault())
+                    .format(new java.util.Date(snoozedUntil));
+            TextView snooze = text(snoozeDescription, 14, BLUE);
+            snooze.setTypeface(null, Typeface.BOLD);
+            snooze.setPadding(dp(9), dp(5), dp(9), dp(5));
+            snooze.setBackground(round(SOFT, 12));
+            LinearLayout.LayoutParams badge = new LinearLayout.LayoutParams(-2, -2);
+            badge.topMargin = dp(8);
+            info.addView(snooze, badge);
+        }
         if (!alarm.isNull("schedulingError") && !alarm.optString("schedulingError", "").isEmpty()) {
             TextView error = text(alarm.optString("schedulingError"), 12, RED);
             error.setPadding(dp(2), dp(8), dp(8), 0);
             info.addView(error);
         }
-        info.setContentDescription("Edit alarm " + time.getText() + ", " + schedule.getText());
+        info.setContentDescription("Edit alarm " + time.getText() + ", " + schedule.getText()
+                + (snoozeDescription.isEmpty() ? "" : ", " + snoozeDescription));
         info.setOnClickListener(v -> editAlarm(alarm));
+        info.setOnLongClickListener(v -> { alarmMenu(alarm); return true; });
+        addAlarmDeleteAccessibilityAction(info, alarm);
         top.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
         Switch toggle = makeSwitch(enabled);
         toggle.setContentDescription("Enable alarm " + time.getText());
@@ -324,8 +444,9 @@ public class MainActivity extends Activity {
                     resetting[0] = false;
                     return;
                 }
-                AlarmStore.saveAlarm(this, changed);
+                JSONObject saved = AlarmStore.saveAlarm(this, changed);
                 showHome();
+                if (checked) showAlarmConfirmation(saved);
             } catch (Exception e) {
                 view.setOnCheckedChangeListener(null);
                 view.setChecked(enabled);
@@ -334,10 +455,120 @@ public class MainActivity extends Activity {
             }
         });
         top.addView(toggle, new LinearLayout.LayoutParams(dp(58), dp(52)));
-        card.addView(top);
+        FrameLayout swipeLayer = new FrameLayout(this);
+        TextView swipeHint = text("Delete", 12, RED);
+        swipeHint.setTypeface(null, Typeface.BOLD);
+        swipeHint.setPadding(dp(3), 0, dp(3), 0);
+        swipeHint.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        swipeHint.setVisibility(View.INVISIBLE);
+        swipeLayer.addView(swipeHint, new FrameLayout.LayoutParams(-1, -1));
+        top.setBackground(round(WHITE, 12));
+        swipeLayer.addView(top, new FrameLayout.LayoutParams(-1, -2));
+        card.addView(swipeLayer);
+        card.setSwipeViews(top, toggle, swipeHint);
         card.setOnClickListener(v -> editAlarm(alarm));
         card.setOnLongClickListener(v -> { alarmMenu(alarm); return true; });
+        addAlarmDeleteAccessibilityAction(card, alarm);
         return card;
+    }
+
+    private void addAlarmDeleteAccessibilityAction(View view, JSONObject alarm) {
+        view.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+            @Override public void onInitializeAccessibilityNodeInfo(View host, AccessibilityNodeInfo info) {
+                super.onInitializeAccessibilityNodeInfo(host, info);
+                info.addAction(new AccessibilityNodeInfo.AccessibilityAction(
+                        AccessibilityNodeInfo.ACTION_DISMISS, "Delete alarm"));
+            }
+            @Override public boolean performAccessibilityAction(View host, int action, Bundle args) {
+                if (action == AccessibilityNodeInfo.ACTION_DISMISS) {
+                    confirmDeleteAlarm(alarm);
+                    return true;
+                }
+                return super.performAccessibilityAction(host, action, args);
+            }
+        });
+    }
+
+    // Observe the entire row, including its clickable info child, without consuming
+    // taps, long presses, switch gestures or vertical ScrollView drags.
+    private final class SwipeAlarmCard extends LinearLayout {
+        private final JSONObject alarm;
+        private final int slop = ViewConfiguration.get(MainActivity.this).getScaledTouchSlop();
+        private View content, toggle;
+        private TextView hint;
+        private float startX, startY;
+        private long downTime;
+        private boolean tracking, dragging;
+
+        SwipeAlarmCard(JSONObject alarm) { super(MainActivity.this); this.alarm = alarm; }
+        void setSwipeViews(View content, View toggle, TextView hint) {
+            this.content = content; this.toggle = toggle; this.hint = hint;
+        }
+
+        @Override public boolean dispatchTouchEvent(MotionEvent event) {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                resetSwipe();
+                Rect switchBounds = new Rect();
+                toggle.getDrawingRect(switchBounds);
+                offsetDescendantRectToMyCoords(toggle, switchBounds);
+                tracking = !switchBounds.contains((int) event.getX(), (int) event.getY());
+                startX = event.getX(); startY = event.getY(); downTime = event.getEventTime();
+            } else if (action == MotionEvent.ACTION_POINTER_DOWN || action == MotionEvent.ACTION_POINTER_UP) {
+                tracking = false;
+                if (dragging) { resetSwipeAppearance(); return true; }
+            } else if (action == MotionEvent.ACTION_MOVE && tracking && event.getPointerCount() == 1) {
+                float dx = event.getX() - startX, dy = event.getY() - startY;
+                if (!dragging) {
+                    // Once vertical movement or a hold wins, do not later reinterpret it as a swipe.
+                    if (Math.abs(dy) > slop && Math.abs(dy) >= Math.abs(dx)) tracking = false;
+                    else if (event.getEventTime() - downTime >= ViewConfiguration.getLongPressTimeout()) tracking = false;
+                    else if (Math.abs(dx) > slop && Math.abs(dx) > Math.abs(dy) * 1.5f) {
+                        dragging = true;
+                        getParent().requestDisallowInterceptTouchEvent(true);
+                        // Cancel the original child/card press so release cannot edit or toggle.
+                        MotionEvent cancel = MotionEvent.obtain(event);
+                        cancel.setAction(MotionEvent.ACTION_CANCEL);
+                        super.dispatchTouchEvent(cancel);
+                        cancel.recycle();
+                        setBackground(round(SOFT, 26));
+                    }
+                }
+                if (dragging) {
+                    hint.setGravity(Gravity.CENTER_VERTICAL | (dx >= 0 ? Gravity.LEFT : Gravity.RIGHT));
+                    hint.setVisibility(View.VISIBLE);
+                    content.setTranslationX(Math.max(-dp(48), Math.min(dp(48), dx)));
+                    return true;
+                }
+            }
+            if (dragging) {
+                if (action == MotionEvent.ACTION_UP) {
+                    float dx = event.getX() - startX, dy = event.getY() - startY;
+                    boolean completed = tracking && event.getPointerCount() == 1
+                            && Math.abs(dx) >= Math.max(dp(96), getWidth() * 0.25f)
+                            && Math.abs(dx) > Math.abs(dy) * 1.5f;
+                    resetSwipe();
+                    if (completed && isAttachedToWindow() && "home".equals(screen)) confirmDeleteAlarm(alarm);
+                } else if (action == MotionEvent.ACTION_CANCEL) resetSwipe();
+                return true;
+            }
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) tracking = false;
+            return super.dispatchTouchEvent(event);
+        }
+
+        private void resetSwipeAppearance() {
+            if (content != null) content.setTranslationX(0);
+            if (hint != null) hint.setVisibility(View.INVISIBLE);
+            setBackground(round(WHITE, 26));
+        }
+        private void resetSwipe() {
+            if (dragging) {
+                resetSwipeAppearance();
+                if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
+            }
+            tracking = false; dragging = false;
+        }
+        @Override protected void onDetachedFromWindow() { resetSwipe(); super.onDetachedFromWindow(); }
     }
 
     private void alarmMenu(JSONObject alarm) {
@@ -347,21 +578,21 @@ public class MainActivity extends Activity {
     }
 
     private void newAlarm() {
-        Calendar next = Calendar.getInstance();
-        next.add(Calendar.HOUR_OF_DAY, 1);
+        Calendar now = Calendar.getInstance();
         draft = new JSONObject();
         try {
-            draft.put("hour", next.get(Calendar.HOUR_OF_DAY)); draft.put("minute", 0);
+            draft.put("hour", now.get(Calendar.HOUR_OF_DAY)); draft.put("minute", now.get(Calendar.MINUTE));
             draft.put("date", JSONObject.NULL); draft.put("days", new JSONArray());
-            draft.put("label", ""); draft.put("enabled", true); draft.put("sound", true);
+            draft.put("label", ""); draft.put("enabled", true); draft.put("sound", false);
             draft.put("vibrate", true); draft.put("snoozeEnabled", true);
             draft.put("snoozeMinutes", 5); draft.put("snoozeCount", 3); draft.put("groupId", JSONObject.NULL);
         } catch (Exception ignored) { }
+        alarmBaseline = alarmSnapshot(draft);
         showAlarmEditor();
     }
 
     private void editAlarm(JSONObject alarm) {
-        try { draft = cloneObject(alarm); showAlarmEditor(); }
+        try { draft = cloneObject(alarm); alarmBaseline = alarmSnapshot(draft); showAlarmEditor(); }
         catch (Exception e) { failure("Could not open alarm", e); }
     }
 
@@ -494,7 +725,7 @@ public class MainActivity extends Activity {
         JSONArray selected = draft.optJSONArray("days");
         for (int i = 0; i < 7; i++) {
             boolean active = containsDay(selected, i + 1);
-            dayChips[i].setTextColor(active ? WHITE : MUTED);
+            dayChips[i].setTextColor(active ? ON_BLUE : MUTED);
             dayChips[i].setBackground(round(active ? BLUE : BG, 24));
             dayChips[i].setSelected(active);
             dayChips[i].setContentDescription(new DateFormatSymbols().getWeekdays()[i + 1] + (active ? ", selected" : ", not selected"));
@@ -602,11 +833,29 @@ public class MainActivity extends Activity {
 
     private void persistAlarm() {
         try {
-            AlarmStore.saveAlarm(this, draft);
+            JSONObject saved = AlarmStore.saveAlarm(this, draft);
             hideKeyboard();
             showHome();
-            toast("Alarm saved");
+            if (saved.optBoolean("enabled")) showAlarmConfirmation(saved);
+            else toast("Alarm saved");
         } catch (Exception e) { failure("Could not save alarm", e); }
+    }
+
+    private boolean hasUpcomingTrigger(JSONObject alarm, long now) {
+        return alarm != null && alarm.optBoolean("enabled") && alarm.isNull("schedulingError")
+                && alarm.optLong("nextTriggerAt", 0) > now;
+    }
+
+    private void showAlarmConfirmation(JSONObject alarm) {
+        String message = null;
+        try {
+            long now = System.currentTimeMillis();
+            if (AlarmStore.accessProblem(this) == null && hasUpcomingTrigger(alarm, now))
+                message = AlarmConfirmation.message(alarm.optLong("nextTriggerAt"), now,
+                        java.time.ZoneId.systemDefault(), Locale.getDefault());
+        } catch (RuntimeException ignored) { /* Saving already succeeded; don't report it as failed. */ }
+        if (message == null) message = "Alarm saved; next trigger unavailable. Check the alarm list.";
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     private boolean canEnable(JSONObject alarm) {
@@ -664,9 +913,27 @@ public class MainActivity extends Activity {
                 if (enabled && !canEnable(changed)) return;
                 changes.add(changed);
             }
-            for (JSONObject changed : changes) AlarmStore.saveAlarm(this, changed);
+            ArrayList<JSONObject> saved = new ArrayList<>();
+            for (JSONObject changed : changes) saved.add(AlarmStore.saveAlarm(this, changed));
             showHome();
-            toast(changes.isEmpty() ? "No alarms to change" : (enabled ? "Group alarms enabled" : "Group alarms disabled"));
+            if (changes.isEmpty()) toast("No alarms to change");
+            else if (!enabled) toast("Group alarms disabled");
+            else if (saved.size() == 1) showAlarmConfirmation(saved.get(0));
+            else {
+                JSONObject earliest = null;
+                long now = System.currentTimeMillis();
+                for (JSONObject alarm : saved) {
+                    if (!hasUpcomingTrigger(alarm, now)) { earliest = null; break; }
+                    if (earliest == null || alarm.optLong("nextTriggerAt") < earliest.optLong("nextTriggerAt")) earliest = alarm;
+                }
+                if (earliest == null || AlarmStore.accessProblem(this) != null)
+                    toast("Alarms enabled; check the list for scheduling problems");
+                else {
+                    String message = AlarmConfirmation.message(earliest.optLong("nextTriggerAt"), now,
+                            java.time.ZoneId.systemDefault(), Locale.getDefault());
+                    Toast.makeText(this, "Group enabled. Next: " + message, Toast.LENGTH_LONG).show();
+                }
+            }
         } catch (Exception e) {
             showHome();
             failure("Some group alarms may not have changed. Review the list", e);
@@ -723,6 +990,7 @@ public class MainActivity extends Activity {
             delete.setTextColor(RED);
             body.addView(delete);
         }
+        groupBaseline = groupSnapshot();
         bottomActions("Save group", v -> saveGroup());
     }
 
@@ -784,7 +1052,7 @@ public class MainActivity extends Activity {
     private void permissionCard(String title, boolean allowed, String detail, View.OnClickListener action) {
         LinearLayout card = card(WHITE, 22);
         TextView heading = text(title, 20, INK); heading.setTypeface(null, Typeface.BOLD); card.addView(heading);
-        TextView status = text(allowed ? "Allowed" : "Action needed", 14, allowed ? 0xff27765a : RED);
+        TextView status = text(allowed ? "Allowed" : "Action needed", 14, allowed ? SUCCESS : RED);
         status.setPadding(0, dp(8), 0, dp(8)); card.addView(status);
         card.addView(text(detail, 14, MUTED));
         TextView button = button(allowed ? "Review settings" : "Allow in settings", !allowed, action);
@@ -843,6 +1111,15 @@ public class MainActivity extends Activity {
         if ("home".equals(screen)) super.onBackPressed(); else leaveEditor();
     }
     private void leaveEditor() {
+        if ("alarm".equals(screen)) {
+            captureAlarm();
+            if (alarmBaseline != null && alarmBaseline.equals(alarmSnapshot(draft))) {
+                hideKeyboard(); showHome(); return;
+            }
+        }
+        if ("group".equals(screen) && groupBaseline != null && groupBaseline.equals(groupSnapshot())) {
+            hideKeyboard(); showHome(); return;
+        }
         if ("alarm".equals(screen) || "group".equals(screen)) {
             new AlertDialog.Builder(this).setTitle("Discard changes?").setMessage("Changes on this screen have not been saved.")
                     .setNegativeButton("Keep editing", null).setPositiveButton("Discard", (d, w) -> { hideKeyboard(); showHome(); }).show();
@@ -868,20 +1145,20 @@ public class MainActivity extends Activity {
     }
     private TextView icon(String value, String description, View.OnClickListener action) {
         TextView view = text(value, 30, INK); view.setGravity(Gravity.CENTER); view.setContentDescription(description);
-        view.setBackground(new RippleDrawable(ColorStateList.valueOf(0x22365ee9), null, round(WHITE, 24)));
+        view.setBackground(new RippleDrawable(ColorStateList.valueOf(RIPPLE), null, round(WHITE, 24)));
         if (action != null) view.setOnClickListener(action); return view;
     }
     private TextView button(String title, boolean primary, View.OnClickListener action) {
-        TextView view = text(title, 16, primary ? WHITE : BLUE); view.setTypeface(null, Typeface.BOLD);
+        TextView view = text(title, 16, primary ? ON_BLUE : BLUE); view.setTypeface(null, Typeface.BOLD);
         view.setGravity(Gravity.CENTER); view.setMinHeight(dp(52)); view.setPadding(dp(12), dp(8), dp(12), dp(8));
-        view.setBackground(new RippleDrawable(ColorStateList.valueOf(primary ? 0x33ffffff : 0x22365ee9), round(primary ? BLUE : SOFT, 18), null));
+        view.setBackground(new RippleDrawable(ColorStateList.valueOf(primary ? RIPPLE_ON_BLUE : RIPPLE), round(primary ? BLUE : SOFT, 18), null));
         view.setOnClickListener(action); return view;
     }
     private GradientDrawable round(int color, int radius) { GradientDrawable shape = new GradientDrawable(); shape.setColor(color); shape.setCornerRadius(dp(radius)); return shape; }
     private ColorStateList tint() { return new ColorStateList(new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}}, new int[]{BLUE, OFF}); }
     private Switch makeSwitch(boolean checked) {
         Switch view = new Switch(this); view.setChecked(checked); view.setShowText(false); view.setThumbTintList(tint());
-        view.setTrackTintList(new ColorStateList(new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}}, new int[]{0xffaabcf9, 0xffdae0eb}));
+        view.setTrackTintList(new ColorStateList(new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}}, new int[]{TRACK_ON, TRACK_OFF}));
         view.setMinHeight(dp(48)); view.setSwitchMinWidth(dp(46)); view.setGravity(Gravity.CENTER); return view;
     }
     private LinearLayout optionRow(String title, String subtitle) {
@@ -890,7 +1167,7 @@ public class MainActivity extends Activity {
         TextView value = text(subtitle, 13, MUTED); value.setPadding(0, dp(6), 0, 0); labels.addView(value);
         line.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
         TextView chevron = text("›", 25, OFF); chevron.setGravity(Gravity.CENTER); line.addView(chevron, new LinearLayout.LayoutParams(dp(28), dp(48)));
-        line.setBackground(new RippleDrawable(ColorStateList.valueOf(0x15365ee9), null, round(WHITE, 10))); return line;
+        line.setBackground(new RippleDrawable(ColorStateList.valueOf(RIPPLE_SUBTLE), null, round(WHITE, 10))); return line;
     }
     private Switch addSwitchOption(LinearLayout parent, String title, String detail, boolean checked) {
         LinearLayout line = row(); line.setPadding(0, dp(14), 0, dp(14)); line.setMinimumHeight(dp(82));
@@ -914,6 +1191,29 @@ public class MainActivity extends Activity {
     }
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private JSONObject cloneObject(JSONObject original) throws Exception { return new JSONObject(original.toString()); }
+    // Group names are saved trimmed; member identity, not display order, defines a change.
+    private String groupSnapshot() {
+        java.util.TreeSet<Long> selected = new java.util.TreeSet<>();
+        for (int i = 0; i < memberChecks.size(); i++) if (memberChecks.get(i).isChecked()) selected.add(memberIds.get(i));
+        JSONArray members = new JSONArray();
+        for (Long id : selected) members.put(id);
+        return new JSONArray().put(groupName.getText().toString().trim()).put(members).toString();
+    }
+    // Compare only editable values, not transient scheduler fields or JSON key order.
+    private String alarmSnapshot(JSONObject alarm) {
+        JSONArray days = alarm.optJSONArray("days");
+        int dayMask = 0;
+        for (int day = 1; day <= 7; day++) if (containsDay(days, day)) dayMask |= 1 << day;
+        return new JSONArray().put(alarm.optInt("hour", 7)).put(alarm.optInt("minute", 0))
+                .put(alarm.isNull("date") ? JSONObject.NULL : alarm.optString("date"))
+                .put(dayMask).put(alarm.optString("label", "").trim())
+                .put(alarm.optBoolean("enabled", true)).put(alarm.optBoolean("sound", true))
+                .put(alarm.optBoolean("vibrate", true)).put(alarm.optString("vibrationPattern", "basic"))
+                .put(alarm.optBoolean("snoozeEnabled", true)).put(alarm.optInt("snoozeMinutes", 5))
+                .put(alarm.optInt("snoozeCount", 3))
+                .put(alarm.isNull("groupId") ? JSONObject.NULL : alarm.optLong("groupId"))
+                .toString();
+    }
     private boolean containsDay(JSONArray days, int day) { if (days != null) for (int i = 0; i < days.length(); i++) if (days.optInt(i) == day) return true; return false; }
     private SimpleDateFormat isoFormat() { SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd", Locale.US); f.setLenient(false); return f; }
     private String timeString(JSONObject a) { return String.format(Locale.getDefault(), "%02d:%02d", a.optInt("hour"), a.optInt("minute")); }

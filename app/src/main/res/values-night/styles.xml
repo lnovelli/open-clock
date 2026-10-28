@@ -1,0 +1,29 @@
+<resources>
+    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#AABEFF</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#121722</item>
+        <item name="android:navigationBarColor">#121722</item>
+        <item name="android:statusBarColor">#121722</item>
+        <item name="android:alertDialogTheme">@style/ClockDialogTheme</item>
+        <item name="android:datePickerDialogTheme">@style/ClockDialogTheme</item>
+        <item name="android:popupMenuStyle">@style/ClockPopupMenu</item>
+    </style>
+
+    <style name="ClockDialogTheme" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#AABEFF</item>
+        <item name="android:windowBackground">@drawable/dialog_surface</item>
+        <item name="android:windowElevation">12dp</item>
+        <item name="android:windowMinWidthMinor">87%</item>
+        <item name="android:windowMinWidthMajor">70%</item>
+    </style>
+
+    <style name="ClockPopupMenu" parent="android:style/Widget.Material.PopupMenu">
+        <item name="android:popupBackground">@drawable/menu_surface</item>
+        <item name="android:popupElevation">8dp</item>
+    </style>
+</resources>
