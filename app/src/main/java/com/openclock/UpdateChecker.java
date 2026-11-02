@@ -17,6 +17,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
 
 import androidx.core.content.FileProvider;
 
@@ -35,6 +37,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -142,6 +145,7 @@ public final class UpdateChecker {
 
         void cancel() {
             cancelled = true;
+            keepDownloadScreenOn(false);
             HttpURLConnection c = connection;
             if (c != null) c.disconnect();
             if (application != null && lifecycle != null) {
@@ -202,7 +206,8 @@ public final class UpdateChecker {
                 return;
             }
             dialog.setTitle("Preparing update");
-            dialog.setMessage("Downloading and verifying…");
+            dialog.setMessage("Downloading…\nConnecting…");
+            keepDownloadScreenOn(true);
             new Thread(() -> {
                 File file = null;
                 try {
@@ -214,6 +219,7 @@ public final class UpdateChecker {
                     }
                     file = File.createTempFile("open-clock-", ".apk", dir);
                     download(release.url, file);
+                    post(() -> dialog.setMessage("Download complete.\nVerifying APK…"));
                     verifyApk(current.getPackageManager(), current.getPackageName(), file, release.version);
                     if (cancelled || live() == null) return;
                     File verified = file;
@@ -226,7 +232,10 @@ public final class UpdateChecker {
                     });
                     file = null; // installer needs this cache file after the dialog closes
                 } catch (Exception e) {
-                    post(() -> message("Update not installed", errorMessage(e)));
+                    post(() -> {
+                        keepDownloadScreenOn(false);
+                        message("Update not installed", errorMessage(e));
+                    });
                 } finally {
                     if (file != null) file.delete();
                 }
@@ -236,6 +245,7 @@ public final class UpdateChecker {
         void launchInstaller(File file) {
             Activity a = live();
             if (a == null || dialog == null) { file.delete(); return; }
+            keepDownloadScreenOn(false);
             try {
                 // Recheck because settings and the installed app can change during download.
                 if (!a.getPackageManager().canRequestPackageInstalls()) {
@@ -252,6 +262,28 @@ public final class UpdateChecker {
                 message("Installer unavailable", "Could not open the system installer. "
                         + "The update was not installed; install it manually if supported.");
             }
+        }
+
+        // Scope this to the visible watch dialog, not the whole activity or a wake lock.
+        void keepDownloadScreenOn(boolean keep) {
+            if (!"watch".equals(role) || dialog == null) return;
+            Window window = dialog.getWindow();
+            if (window == null) return;
+            if (keep) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+
+        void downloadProgress(long downloaded, long length) {
+            String text;
+            double mb = downloaded / (1024.0 * 1024.0);
+            if (length > 0) {
+                long percent = Math.min(100, downloaded * 100 / length);
+                text = String.format(Locale.getDefault(), "Downloading…\n%.1f / %.1f MB (%d%%)",
+                        mb, length / (1024.0 * 1024.0), percent);
+            } else {
+                text = String.format(Locale.getDefault(), "Downloading…\n%.1f MB", mb);
+            }
+            post(() -> dialog.setMessage(text));
         }
 
         Release fetchRelease() throws Exception {
@@ -290,8 +322,9 @@ public final class UpdateChecker {
                 if (status != 200) throw new IOException("Download returned HTTP " + status + ".");
                 long length = c.getContentLengthLong();
                 if (length > MAX_APK) throw new IOException("APK is too large.");
+                downloadProgress(0, length);
                 try (FileOutputStream out = new FileOutputStream(file)) {
-                    readLimited(c.getInputStream(), MAX_APK, out, System.nanoTime());
+                    readLimited(c.getInputStream(), MAX_APK, out, System.nanoTime(), length);
                 }
             } finally { close(c); }
         }
@@ -328,17 +361,30 @@ public final class UpdateChecker {
         }
 
         byte[] readLimited(InputStream in, long max, FileOutputStream out, long start) throws IOException {
+            return readLimited(in, max, out, start, -1);
+        }
+
+        byte[] readLimited(InputStream in, long max, FileOutputStream out, long start, long length) throws IOException {
             ByteArrayOutputStream memory = out == null ? new ByteArrayOutputStream() : null;
             try (InputStream input = in) {
                 byte[] buffer = new byte[16384];
                 long total = 0;
+                long lastProgress = 0;
                 int n;
                 while ((n = input.read(buffer)) != -1) {
                     if (cancelled || System.nanoTime() - start > DEADLINE_NS) throw new IOException("Request cancelled or timed out.");
                     total += n;
                     if (total > max) throw new IOException("Response is too large.");
-                    if (out != null) out.write(buffer, 0, n); else memory.write(buffer, 0, n);
+                    if (out != null) {
+                        out.write(buffer, 0, n);
+                        long now = System.nanoTime();
+                        if (now - lastProgress >= TimeUnit.MILLISECONDS.toNanos(250)) {
+                            lastProgress = now;
+                            downloadProgress(total, length);
+                        }
+                    } else memory.write(buffer, 0, n);
                 }
+                if (out != null) downloadProgress(total, length);
             }
             return memory == null ? null : memory.toByteArray();
         }
