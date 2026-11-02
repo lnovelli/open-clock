@@ -8,7 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
-import android.os.Build;
+
 import android.os.SystemClock;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -137,7 +137,10 @@ public final class PhoneMirror {
                     // Reserve alert delivery before posting; process death cannot replay it.
                     if (!unposted.isEmpty()) {
                         if (!save(c, next)) return false;
-                        for (JSONObject a : unposted) post(c, a, remaining(c, a));
+                        for (JSONObject a : unposted) {
+                            post(c, a, remaining(c, a));
+                            AlarmPresentation.mirror(c, a);
+                        }
                     }
                 }
                 if (!live.isEmpty() && notificationsAllowed(c)) start(c);
@@ -211,10 +214,6 @@ public final class PhoneMirror {
         synchronized (LOCK) {
             try {
                 if (!notificationsAllowed(c)) return;
-                int filter = c.getSystemService(NotificationManager.class).getCurrentInterruptionFilter();
-                // Match the mirror service's conservative DND policy.
-                if (filter != NotificationManager.INTERRUPTION_FILTER_ALL &&
-                        filter != NotificationManager.INTERRUPTION_FILTER_ALARMS) return;
                 JSONArray state = records(c);
                 List<JSONObject> alerts = new ArrayList<>();
                 for (JSONObject a : liveLocked(c, PhoneSync.cached(c), state)) {
@@ -243,7 +242,15 @@ public final class PhoneMirror {
             ch.enableVibration(vibration);
             if (vibration) ch.setVibrationPattern(new long[]{0, 600, 400, 600});
             NotificationManager nm = c.getSystemService(NotificationManager.class);
+            // Only notification channels can request priority-mode bypass; direct
+            // MediaPlayer/Vibrator output remains subject to Android's DND policy.
+            if (nm.isNotificationPolicyAccessGranted()) ch.setBypassDnd(true);
             nm.createNotificationChannel(ch);
+            NotificationChannel actual = nm.getNotificationChannel(channel);
+            // User-edited channels may enable an output disabled on this occurrence.
+            // The regular silent control notification already exists; skip this
+            // fallback rather than use the now-incompatible channel.
+            if (actual == null || (!sound && actual.getSound() != null) || (!vibration && actual.shouldVibrate())) return;
             PendingIntent open = open(c, a);
             String label = a.optString("label").trim(); if (label.isEmpty()) label = "Phone alarm";
             Notification.Builder b = new Notification.Builder(c, channel).setSmallIcon(R.drawable.ic_alarm)
@@ -257,7 +264,9 @@ public final class PhoneMirror {
         NotificationChannel ch = new NotificationChannel(CHANNEL, "Phone alarms", NotificationManager.IMPORTANCE_HIGH);
         ch.setDescription("Phone alarm controls; sound and vibration follow the phone alarm and Do Not Disturb.");
         ch.setSound(null, null); ch.enableVibration(false); ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
-        c.getSystemService(NotificationManager.class).createNotificationChannel(ch);
+        NotificationManager nm = c.getSystemService(NotificationManager.class);
+        if (nm.isNotificationPolicyAccessGranted()) ch.setBypassDnd(true);
+        nm.createNotificationChannel(ch);
     }
     static boolean notificationsAllowed(Context c) {
         try {
@@ -267,12 +276,14 @@ public final class PhoneMirror {
             return nm.areNotificationsEnabled() && channel != null && channel.getImportance() != NotificationManager.IMPORTANCE_NONE;
         } catch (RuntimeException denied) { return false; }
     }
-    static PendingIntent open(Context c, JSONObject a) {
-        Intent i = new Intent(c, PhoneMirrorActivity.class)
+    static Intent openIntent(Context c, JSONObject a) {
+        return new Intent(c, PhoneMirrorActivity.class)
                 .setData(Uri.parse("openclock://phone-ring/" + a.optLong("id") + "/" + a.optString("token")))
                 .putExtra("id", a.optLong("id")).putExtra("token", a.optString("token"))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        return PendingIntent.getActivity(c, 0, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+    static PendingIntent open(Context c, JSONObject a) {
+        return PendingIntent.getActivity(c, 0, openIntent(c, a), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
     static void post(Context c, JSONObject a, long remaining) {
         if (remaining <= 0) return;
@@ -284,7 +295,6 @@ public final class PhoneMirror {
                     .setCategory(Notification.CATEGORY_ALARM).setVisibility(Notification.VISIBILITY_PUBLIC)
                     .setOngoing(true).setOnlyAlertOnce(true).setContentIntent(open).setTimeoutAfter(remaining);
             NotificationManager nm = c.getSystemService(NotificationManager.class);
-            if (Build.VERSION.SDK_INT < 34 || nm.canUseFullScreenIntent()) b.setFullScreenIntent(open, true);
             nm.notify(tag(a), ALERT_ID, b.build());
         } catch (RuntimeException ignored) { /* notification permission/channel may be blocked */ }
     }

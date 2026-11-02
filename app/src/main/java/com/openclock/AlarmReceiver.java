@@ -11,6 +11,7 @@ public final class AlarmReceiver extends BroadcastReceiver {
             String action=intent.getAction();
             if("com.openclock.FIRE".equals(action)) {
                 if(!AlarmStore.fire(c,id,token)) return;
+                AlarmPresentation.local(c,id);
                 AlarmStore.recoverRinging(c);
             } else if("com.openclock.DISMISS".equals(action)||"com.openclock.SNOOZE".equals(action)) {
                 AlarmStore.finish(c,id,token,"com.openclock.SNOOZE".equals(action));

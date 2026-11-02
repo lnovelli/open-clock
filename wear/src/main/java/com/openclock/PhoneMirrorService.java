@@ -13,6 +13,8 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.VibrationEffect;
+import android.os.VibrationAttributes;
+import android.os.Build;
 import android.os.Vibrator;
 import android.provider.Settings;
 import org.json.JSONObject;
@@ -56,10 +58,11 @@ public final class PhoneMirrorService extends Service {
             if (!found) PhoneMirror.cancel(this, prior);
         }
         displayed.clear(); displayed.addAll(live);
-        if (live.isEmpty() || !PhoneMirror.notificationsAllowed(this)) { stopSelf(); return; }
+        if (live.isEmpty() || !PhoneMirror.notificationsAllowed(this)) { WatchShakeBridge.mirror(this, false); stopSelf(); return; }
         try {
             getSystemService(NotificationManager.class).notify(PhoneMirror.SERVICE_ID, PhoneMirror.summary(this, live));
             if (!wake.isHeld()) wake.acquire(10 * 60_000L + 5000);
+            WatchShakeBridge.mirror(this, true);
             JSONObject sound = null; boolean wantVibration = false;
             for (JSONObject a : live) {
                 if (a.optBoolean("sound") && (sound == null || a.optLong("id") < sound.optLong("id"))) sound = a;
@@ -88,17 +91,18 @@ public final class PhoneMirrorService extends Service {
                 focused = audio.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
                 if (focused && prepared && soundAllowed()) player.start();
             }
-            // Conservative DND: do not vibrate in priority-only mode, whose policy may disallow alarms.
-            int filter = getSystemService(NotificationManager.class).getCurrentInterruptionFilter();
-            boolean allowVibration = wantVibration && !localVibration && (filter == NotificationManager.INTERRUPTION_FILTER_ALL
-                    || filter == NotificationManager.INTERRUPTION_FILTER_ALARMS);
+            // Alarm usage lets Android enforce the active DND policy, including
+            // priority mode with alarms allowed, rather than filtering it here.
+            boolean allowVibration = wantVibration && !localVibration;
             if (allowVibration && now >= nextVibration && vibrator != null && vibrator.hasVibrator()) {
                 long duration = 0;
                 for (JSONObject a : live) if (a.optBoolean("vibrate")) duration = Math.max(duration, PhoneMirror.remaining(this, a));
                 // A finite pulse cannot become an unbounded vibration after process death.
                 if (duration > 0) {
-                    vibrator.vibrate(VibrationEffect.createOneShot(Math.min(600, duration), VibrationEffect.DEFAULT_AMPLITUDE),
-                            new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
+                    VibrationEffect effect = VibrationEffect.createOneShot(Math.min(600, duration), VibrationEffect.DEFAULT_AMPLITUDE);
+                    if (Build.VERSION.SDK_INT >= 33)
+                        vibrator.vibrate(effect, new VibrationAttributes.Builder().setUsage(VibrationAttributes.USAGE_ALARM).build());
+                    else vibrator.vibrate(effect, new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
                     vibrating = true; nextVibration = now + 1000;
                 }
             } else if (!allowVibration && vibrating) { cancelVibration(); }
@@ -109,9 +113,7 @@ public final class PhoneMirrorService extends Service {
     }
     private boolean soundAllowed() {
         JSONObject a = PhoneMirror.current(this, soundId, soundToken);
-        int filter = getSystemService(NotificationManager.class).getCurrentInterruptionFilter();
-        return a != null && a.optBoolean("sound") && (filter == NotificationManager.INTERRUPTION_FILTER_ALL
-                || filter == NotificationManager.INTERRUPTION_FILTER_ALARMS);
+        return a != null && a.optBoolean("sound");
     }
     private void play() {
         if (!soundAllowed() || audio == null) return;
@@ -166,6 +168,7 @@ public final class PhoneMirrorService extends Service {
         vibrating = false;
     }
     @Override public void onDestroy() {
+        WatchShakeBridge.mirror(this, false);
         handler.removeCallbacksAndMessages(null); stopAudio();
         if (vibrating) cancelVibration();
         if (wake != null && wake.isHeld()) wake.release();

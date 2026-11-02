@@ -23,11 +23,12 @@ tasks.register('prepareWatchEngine', Sync) {
         include 'com/openclock/AlarmStore.java', 'com/openclock/AlarmTimes.java',
                 'com/openclock/AlarmReceiver.java', 'com/openclock/RestoreReceiver.java',
                 'com/openclock/AlarmNotifications.java', 'com/openclock/RingingService.java',
-                'com/openclock/ClockApplication.java'
+                'com/openclock/ClockApplication.java',
+                'com/openclock/UpdateChecker.java'
         into 'java'
     }
     from('../app/src/main/res') {
-        include 'drawable/ic_alarm.xml', 'raw/alarm_sound.wav'
+        include 'drawable/ic_alarm.xml', 'raw/alarm_sound.wav', 'xml/update_file_paths.xml'
         into 'res'
     }
     into layout.buildDirectory.dir('generated/watch-engine')

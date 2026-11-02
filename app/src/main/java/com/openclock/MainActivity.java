@@ -244,6 +244,7 @@ public class MainActivity extends Activity {
                 popup.getMenu().add("Create group").setOnMenuItemClickListener(item -> { showGroupEditor(-1); return true; });
                 popup.getMenu().add("Alarm permissions").setOnMenuItemClickListener(item -> { showPermissions(); return true; });
                 popup.getMenu().add("Apps & access").setOnMenuItemClickListener(item -> { startActivity(new Intent(this, AccessActivity.class)); return true; });
+                popup.getMenu().add("Check for updates").setOnMenuItemClickListener(item -> { UpdateChecker.show(this, "phone"); return true; });
                 popup.show();
             });
             row.addView(menu, new LinearLayout.LayoutParams(dp(48), dp(48)));
@@ -1041,10 +1042,23 @@ public class MainActivity extends Activity {
         explanation.setPadding(0, dp(12), 0, dp(22)); body.addView(explanation);
         permissionCard("Precise alarms", exactAllowed(), "Required on Android 12 and later to ring at the selected time, even while the phone is idle.", v -> openExactSettings());
         permissionCard("Notifications", notificationsAllowed(), "Shows the ringing alarm and its snooze/dismiss controls. Required on Android 13 and later.", v -> requestNotifications());
-        permissionCard("Full-screen alarms", fullScreenAllowed(), "On Android 14 and later, allow full-screen intents to bring a ringing alarm over the lock screen. Without it, Android may show a notification instead.", v -> {
+        permissionCard("Full-screen alarms", fullScreenAllowed(), "Allow full-screen intents to bring a ringing alarm over the lock screen. Also keep the Ringing alarms channel at High importance; DND and device settings can still block the screen. Without full-screen access, Android may show a notification instead.", v -> {
             if (Build.VERSION.SDK_INT >= 34) openSettings(new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + getPackageName())));
             else openNotificationSettings();
         });
+        LinearLayout dnd = card(WHITE, 22);
+        TextView dndHeading = text("Do Not Disturb", 20, INK); dndHeading.setTypeface(null, Typeface.BOLD); dnd.addView(dndHeading);
+        TextView dndDetail = text("In Android's Do Not Disturb settings, allow alarms for each mode you use. Open Clock requests alarm sound and vibration only when enabled for that alarm. Android, device settings, or a zero alarm volume may still silence them; total silence may block alarms. This is not a guarantee.", 14, MUTED);
+        dndDetail.setPadding(0, dp(10), 0, 0); dnd.addView(dndDetail);
+        TextView dndButton = button("Open DND alarm settings", false, v -> openDndSettings());
+        LinearLayout.LayoutParams dndParams = new LinearLayout.LayoutParams(-1, dp(50)); dndParams.topMargin = dp(18); dnd.addView(dndButton, dndParams);
+        TextView channelDetail = text("Optional DND access lets Open Clock request priority-mode bypass for the ringing channel, where Android permits. After granting access, check that the channel is High importance and may override DND. This does not bypass DND for separate alarm sound or vibration. Leave channel sound and vibration off to respect each alarm's choices.", 14, MUTED);
+        channelDetail.setPadding(0, dp(16), 0, 0); dnd.addView(channelDetail);
+        TextView policyButton = button("Open DND access", false, v -> openSettings(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)));
+        LinearLayout.LayoutParams policyParams = new LinearLayout.LayoutParams(-1, dp(50)); policyParams.topMargin = dp(18); dnd.addView(policyButton, policyParams);
+        TextView channelButton = button("Open ringing channel settings", false, v -> openRingingChannelSettings());
+        LinearLayout.LayoutParams channelParams = new LinearLayout.LayoutParams(-1, dp(50)); channelParams.topMargin = dp(18); dnd.addView(channelButton, channelParams);
+        addBlock(body, dnd, 16);
         TextView help = text("Also check the system alarm volume, notification channel, Do Not Disturb, and any manufacturer battery restrictions. Sound uses the standard system alarm tone; vibration depends on your device.", 13, MUTED);
         help.setPadding(dp(6), dp(12), dp(6), dp(12)); body.addView(help);
     }
@@ -1098,6 +1112,21 @@ public class MainActivity extends Activity {
     private void openNotificationSettings() {
         if (Build.VERSION.SDK_INT >= 26) openSettings(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
         else openSettings(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+    }
+    private void openDndSettings() {
+        try { startActivity(new Intent(Settings.ACTION_ZEN_MODE_PRIORITY_SETTINGS)); }
+        catch (Exception e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_SOUND_SETTINGS));
+                toast("Find Do Not Disturb and allow alarms in the modes you use.");
+            } catch (Exception again) { notice("Settings unavailable", "Open Android Settings → Do Not Disturb and allow alarms in the modes you use."); }
+        }
+    }
+    private void openRingingChannelSettings() {
+        AlarmNotifications.channels(this);
+        openSettings(new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName())
+                .putExtra(Settings.EXTRA_CHANNEL_ID, AlarmNotifications.RING_CHANNEL));
     }
     private void openSettings(Intent intent) {
         try { startActivity(intent); }

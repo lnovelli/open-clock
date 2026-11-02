@@ -20,6 +20,8 @@ public final class RingingService extends Service {
     private long playingId=-1;
     private boolean vibrating, prepared, hasFocus;
     private String vibratingPattern="";
+    private long nextVibrationRetry;
+    private int vibrationFilter=-1;
     private long nextFocusRetry, nextAudioRetry, audioGeneration, prepareDeadline;
     private final Map<Long,String> shown=new HashMap<>();
     private final Runnable tick=new Runnable() { public void run() { reconcile(); } };
@@ -59,22 +61,29 @@ public final class RingingService extends Service {
                 if(a.optBoolean("vibrate")&&(vibration==null||a.getLong("id")<vibration.getLong("id"))) vibration=a;
             }
             for(Long id:new HashSet<>(shown.keySet())) if(!current.contains(id)) { nm.cancel("alarm:"+id,11); shown.remove(id); }
-            if(active.length()==0) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return; }
+            if(active.length()==0) { WatchShakeBridge.local(this,false); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return; }
             nm.notify(AlarmNotifications.SERVICE_ID,AlarmNotifications.summary(this,active.length()));
             if(!wake.isHeld()) wake.acquire(AlarmStore.RING_TIMEOUT+10_000);
+            WatchShakeBridge.local(this,true);
             String token=sound==null?"":sound.getJSONObject("_active").getString("token");
             if(!token.equals(playing)) { stopAudio(); playing=token; playingId=sound==null?-1:sound.getLong("id"); nextAudioRetry=0; }
             long elapsed=SystemClock.elapsedRealtime();
             if(player!=null&&!prepared&&elapsed>=prepareDeadline) stopAudio();
             if(sound!=null&&player==null&&elapsed>=nextAudioRetry) { nextAudioRetry=elapsed+5000; play(); }
             else if(sound!=null&&!hasFocus&&focus!=null&&elapsed>=nextFocusRetry) requestFocus();
-            // Vibration honors the user's Do Not Disturb policy; never request policy bypass.
-            boolean dndAllows=nm.getCurrentInterruptionFilter()==NotificationManager.INTERRUPTION_FILTER_ALL||nm.getCurrentInterruptionFilter()==NotificationManager.INTERRUPTION_FILTER_ALARMS;
-            boolean vibrate=vibration!=null&&dndAllows;
+            // Ask Android as an alarm, including in priority mode: its policy may allow
+            // alarms there. We do not override DND or the individual alarm's choice.
+            int filter=nm.getCurrentInterruptionFilter();
+            boolean vibrate=vibration!=null;
             String pattern=vibrate?vibration.optString("vibrationPattern","basic"):"";
-            if(vibrate&&(!vibrating||!pattern.equals(vibratingPattern))&&vibrator!=null&&vibrator.hasVibrator()) {
-                vibrator.vibrate(VibrationEffect.createWaveform(vibrationWaveform(pattern),0),new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
-                vibrating=true; vibratingPattern=pattern;
+            // Android may discard/cancel a vibration while DND blocks alarms. Retry
+            // periodically in DND so a policy change in the same mode can take effect.
+            if(vibrate&&(!vibrating||!pattern.equals(vibratingPattern)||filter!=vibrationFilter||
+                    (filter!=NotificationManager.INTERRUPTION_FILTER_ALL&&elapsed>=nextVibrationRetry))&&vibrator!=null&&vibrator.hasVibrator()) {
+                VibrationEffect effect=VibrationEffect.createWaveform(vibrationWaveform(pattern),0);
+                if(Build.VERSION.SDK_INT>=33) vibrator.vibrate(effect,new VibrationAttributes.Builder().setUsage(VibrationAttributes.USAGE_ALARM).build());
+                else vibrator.vibrate(effect,new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
+                vibrating=true; vibratingPattern=pattern; vibrationFilter=filter; nextVibrationRetry=elapsed+10_000;
             } else if(!vibrate&&vibrating) { vibrator.cancel(); vibrating=false; vibratingPattern=""; }
             handler.postDelayed(tick,1000);
         } catch(Exception e) { AlarmNotifications.warning(this,AlarmStore.message(e)); stopSelf(); }
@@ -142,6 +151,7 @@ public final class RingingService extends Service {
         if(focus!=null&&audio!=null) { audio.abandonAudioFocusRequest(focus); focus=null; }
     }
     @Override public void onDestroy() {
+        WatchShakeBridge.local(this,false);
         handler.removeCallbacksAndMessages(null); unregisterReceiver(refresh); stopAudio();
         if(vibrator!=null) vibrator.cancel(); if(wake!=null&&wake.isHeld()) wake.release();
         super.onDestroy();

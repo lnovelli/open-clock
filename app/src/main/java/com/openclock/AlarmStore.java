@@ -690,8 +690,9 @@ public final class AlarmStore {
             boolean retry=false;
             for(int i=0;i<as.length();i++) {
                 JSONObject a=as.getJSONObject(i);
-                if(a.optBoolean("enabled")&&a.has("_token")&&a.optLong("_nextAt")<=now)
-                    fire(c,a.optLong("id"),a.optString("_token"));
+                if(a.optBoolean("enabled")&&a.has("_token")&&a.optLong("_nextAt")<=now
+                        &&fire(c,a.optLong("id"),a.optString("_token")))
+                    AlarmPresentation.local(c,a.optLong("id"));
                 if(a.optBoolean("enabled")&&!a.has("_token")&&a.optLong("_retryAt",Long.MAX_VALUE)<=now)
                     retry=true;
             }

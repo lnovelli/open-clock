@@ -3,7 +3,7 @@ package com.openclock;
 import android.app.*;
 import android.content.*;
 import android.net.Uri;
-import android.os.Build;
+
 import org.json.JSONObject;
 
 final class AlarmNotifications {
@@ -14,6 +14,9 @@ final class AlarmNotifications {
         NotificationChannel ring=new NotificationChannel(RING_CHANNEL,"Ringing alarms",NotificationManager.IMPORTANCE_HIGH);
         ring.setDescription("Alarm controls. Sound and vibration follow each alarm's settings; Do Not Disturb still applies.");
         ring.setSound(null,null); ring.enableVibration(false); ring.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        // Optional policy access permits a priority-mode exception for the visual
+        // notification. Android still controls full-screen presentation and alarm audio.
+        if(nm.isNotificationPolicyAccessGranted()) ring.setBypassDnd(true);
         nm.createNotificationChannel(ring);
         NotificationChannel status=new NotificationChannel(STATUS_CHANNEL,"Alarm scheduling problems",NotificationManager.IMPORTANCE_DEFAULT);
         nm.createNotificationChannel(status);
@@ -42,7 +45,8 @@ final class AlarmNotifications {
             .setTimeoutAfter(Math.max(1,AlarmStore.remainingSessionMillis(a.optJSONObject("_active"))))
             .addAction(new Notification.Action.Builder(null,"Dismiss",action(c,a,"com.openclock.DISMISS")).build());
         if(AlarmStore.canSnooze(a)) b.addAction(new Notification.Action.Builder(null,"Snooze "+a.optInt("snoozeMinutes")+" min",action(c,a,"com.openclock.SNOOZE")).build());
-        if(Build.VERSION.SDK_INT<34||c.getSystemService(NotificationManager.class).canUseFullScreenIntent()) b.setFullScreenIntent(open,true);
+        // Wear OS does not support full-screen notification intents.
+        if(AlarmPresentation.fullScreenIntentSupported()) b.setFullScreenIntent(open,true);
         return b.build();
     }
     static Notification summary(Context c,int count) {

@@ -206,7 +206,6 @@ public class MainActivity extends Activity {
         try {
             JSONObject cache = snapshot(); long updated = cache.optLong("updatedAt", 0);
             long age = System.currentTimeMillis() - updated;
-            NotificationManager nm = getSystemService(NotificationManager.class);
             JSONObject creation = PhoneSync.pendingCreate(this), mutation = PhoneSync.pendingMutation(this);
             // Both complete row arrays include snoozedUntil, so pending snooze
             // changes redraw the list without adding revisions or timestamps.
@@ -219,7 +218,6 @@ public class MainActivity extends Activity {
                 .put("mutationReplaced", mutation != null && !cache.optString("epoch", "").isEmpty()
                     && !mutation.optString("epoch", "").equals(cache.optString("epoch", "")))
                 .put("notice", phoneNotice).put("permission", AlarmStore.accessProblem(this))
-                .put("fullscreen", Build.VERSION.SDK_INT < 34 || nm == null || nm.canUseFullScreenIntent())
                 .toString();
         } catch (Exception e) { return "unavailable:" + e.getClass().getName() + ":" + phoneNotice; }
     }
@@ -286,6 +284,38 @@ public class MainActivity extends Activity {
         createStatus();
         mutationStatus();
         phoneList();
+        add(button("Do Not Disturb", CARD, this::dndHelp), 20);
+        add(button("Test double shake", CARD, () -> startActivity(new Intent(this, ShakeTestActivity.class))), 20);
+        add(button("Check for updates", CARD, () -> UpdateChecker.show(this, "watch")), 20);
+    }
+
+    private void dndHelp() {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        boolean granted = nm != null && nm.isNotificationPolicyAccessGranted();
+        new AlertDialog.Builder(this).setTitle("Alarms and Do Not Disturb")
+            .setMessage("Allow alarms in the watch's Do Not Disturb settings. Sound and vibration follow each alarm's settings. "
+                + "DND access is optional and lets alarm notifications request priority-mode bypass; "
+                + "it does not bypass DND for continuous sound or vibration. "
+                + "Wear OS may block opening the alarm screen from the background; tap the notification for controls. "
+                + "Total silence, volume, notification settings and watch restrictions can still prevent alerts.\n\nDND access: "
+                + (granted ? "allowed" : "not allowed"))
+            .setPositiveButton("DND settings", (d, w) -> openDndSettings())
+            .setNeutralButton("DND access", (d, w) -> openDndAccess())
+            .setNegativeButton("Close", null).show();
+    }
+    private void openDndSettings() {
+        try { startActivity(new Intent(Settings.ACTION_ZEN_MODE_PRIORITY_SETTINGS)); }
+        catch (Exception unavailable) {
+            try { startActivity(new Intent(Settings.ACTION_SETTINGS)); }
+            catch (Exception e) { toast("DND settings unavailable on this watch"); }
+        }
+    }
+    private void openDndAccess() {
+        try { startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)); }
+        catch (Exception unavailable) {
+            try { startActivity(new Intent(Settings.ACTION_SETTINGS)); }
+            catch (Exception e) { toast("DND access settings unavailable on this watch"); }
+        }
     }
 
     private boolean createBlocked() {
@@ -471,13 +501,24 @@ public class MainActivity extends Activity {
                 add(button("Allow notifications", CARD, () -> requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7)), 8);
             add(button("Notification settings", CARD, this::notificationSettings), 8);
         }
-        if (Build.VERSION.SDK_INT >= 34) {
+
+        try {
+            PhoneMirror.channels(this);
             NotificationManager nm = getSystemService(NotificationManager.class);
-            if (nm != null && !nm.canUseFullScreenIntent()) {
-                note("Full-screen alarm display is not allowed; alarms may appear as notifications.");
-                add(button("Full-screen access", CARD, () -> settings(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT)), 8);
+            android.app.NotificationChannel mirror = nm == null ? null : nm.getNotificationChannel(PhoneMirror.CHANNEL);
+            if (mirror == null || mirror.getImportance() < NotificationManager.IMPORTANCE_HIGH) {
+                note("Set Phone alarms notifications to High for prominent alerts.");
+                add(button("Phone alarm channel", CARD, () -> channelSettings(PhoneMirror.CHANNEL)), 8);
             }
+        } catch (RuntimeException unavailable) {
+            note("Phone alarm notification settings could not be checked.");
+            add(button("Notification settings", CARD, this::notificationSettings), 8);
         }
+    }
+    private void channelSettings(String channel) {
+        try { startActivity(new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()).putExtra(Settings.EXTRA_CHANNEL_ID, channel)); }
+        catch (Exception e) { notificationSettings(); }
     }
     private void settings(String action) {
         try { startActivity(new Intent(action, Uri.parse("package:" + getPackageName()))); }
