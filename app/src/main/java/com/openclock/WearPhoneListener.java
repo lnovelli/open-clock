@@ -108,7 +108,7 @@ public final class WearPhoneListener extends WearableListenerService {
             JSONObject cmd=new JSONObject(new String(body,StandardCharsets.UTF_8));
             String req=cmd.optString("requestId","");
             if(!req.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")) return;
-            boolean ok=false; String result="Could not update phone alarm; refresh on watch";
+            boolean ok=false; long committedRevision=-1; String result="Could not update phone alarm; refresh on watch";
             try {
                 String op=cmd.optString("op");
                 if(cmd.length()!=7||!WearSync.epoch(this).equals(cmd.optString("epoch"))||
@@ -126,9 +126,11 @@ public final class WearPhoneListener extends WearableListenerService {
                     AlarmStore.wearFinish(this,id,token,cmd.getBoolean("snooze"),issued+15_000);
                 } else throw new IllegalArgumentException();
                 ok=true; result="Phone alarm updated";
+                try { committedRevision=AlarmStore.wearSnapshot(this).getLong("revision"); } catch(Exception ignored) { }
             } catch(Exception ignored) { }
             if(ok) WearSync.publishSoon(this);
             JSONObject reply=new JSONObject().put("requestId",req).put("ok",ok).put("message",result);
+            if(ok && committedRevision>=0) reply.put("revision",committedRevision);
             Wearable.getMessageClient(this).sendMessage(node,WearSync.REPLY,reply.toString().getBytes(StandardCharsets.UTF_8));
         } catch(Exception ignored) { }
     }

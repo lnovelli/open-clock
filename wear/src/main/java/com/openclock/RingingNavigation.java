@@ -7,7 +7,7 @@ import android.widget.Toast;
 import androidx.wear.widget.DismissibleFrameLayout;
 import androidx.wear.widget.SwipeDismissFrameLayout;
 
-/** Back navigation never dismisses or snoozes the ringing occurrence. */
+/** Swipe navigation remains separate from the alarm screen's Back-to-dismiss action. */
 final class RingingNavigation {
     static View wrap(Activity activity, View screen) {
         SwipeDismissFrameLayout root = new SwipeDismissFrameLayout(activity);
@@ -16,8 +16,9 @@ final class RingingNavigation {
         root.addView(screen);
         root.registerCallback(new DismissibleFrameLayout.Callback() {
             @Override public void onDismissFinished(DismissibleFrameLayout layout) {
-                if (layout.isAttachedToWindow() && layout.hasWindowFocus() && !activity.isFinishing())
-                    activity.onBackPressed();
+                if (layout.isAttachedToWindow() && layout.hasWindowFocus() && !activity.isFinishing()) {
+                    if (!backToListIfRoot(activity)) activity.finish();
+                }
             }
         });
         return root;

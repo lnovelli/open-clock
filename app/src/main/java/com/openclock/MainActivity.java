@@ -659,7 +659,13 @@ public class MainActivity extends Activity {
         labelInput.setText(draft.optString("label", ""));
         options.addView(labelInput, new LinearLayout.LayoutParams(-1, dp(52)));
         divider(options);
-        enabledSwitch = addSwitchOption(options, "Alarm enabled", "Turn off to keep without scheduling", draft.optBoolean("enabled", true));
+        if (draft.has("id")) {
+            enabledSwitch = null;
+            LinearLayout enabledInfo = optionRow("Alarm enabled", "Saving enables this alarm");
+            options.addView(enabledInfo);
+        } else {
+            enabledSwitch = addSwitchOption(options, "Alarm enabled", "Turn off to keep without scheduling", draft.optBoolean("enabled", true));
+        }
         divider(options);
         soundSwitch = addSwitchOption(options, "Alarm sound", "Standard system alarm tone", draft.optBoolean("sound", true));
         divider(options);
@@ -711,7 +717,8 @@ public class MainActivity extends Activity {
         try {
             draft.put("hour", hourPicker.getValue()); draft.put("minute", minutePicker.getValue());
             draft.put("label", labelInput.getText().toString().trim());
-            draft.put("enabled", enabledSwitch.isChecked()); draft.put("sound", soundSwitch.isChecked());
+            if (enabledSwitch != null) draft.put("enabled", enabledSwitch.isChecked());
+            draft.put("sound", soundSwitch.isChecked());
             draft.put("vibrate", vibrationSwitch.isChecked()); draft.put("snoozeEnabled", snoozeSwitch.isChecked());
         } catch (Exception ignored) { }
     }
@@ -823,18 +830,23 @@ public class MainActivity extends Activity {
 
     private void saveAlarm() {
         captureAlarm();
-        if (draft.optBoolean("enabled") && !canEnable(draft)) return;
-        if (draft.optBoolean("enabled") && !draft.optBoolean("sound") && !draft.optBoolean("vibrate")) {
+        final JSONObject toSave;
+        try {
+            toSave = cloneObject(draft);
+            if (toSave.has("id")) toSave.put("enabled", true);
+        } catch (Exception e) { failure("Could not save alarm", e); return; }
+        if (toSave.optBoolean("enabled") && !canEnable(toSave)) return;
+        if (toSave.optBoolean("enabled") && !toSave.optBoolean("sound") && !toSave.optBoolean("vibrate")) {
             new AlertDialog.Builder(this).setTitle("Silent alarm?").setMessage("Sound and vibration are both off. This alarm will only show on screen.")
-                    .setNegativeButton("Review", null).setPositiveButton("Save silent alarm", (d, w) -> persistAlarm()).show();
+                    .setNegativeButton("Review", null).setPositiveButton("Save silent alarm", (d, w) -> persistAlarm(toSave)).show();
             return;
         }
-        persistAlarm();
+        persistAlarm(toSave);
     }
 
-    private void persistAlarm() {
+    private void persistAlarm(JSONObject toSave) {
         try {
-            JSONObject saved = AlarmStore.saveAlarm(this, draft);
+            JSONObject saved = AlarmStore.saveAlarm(this, toSave);
             hideKeyboard();
             showHome();
             if (saved.optBoolean("enabled")) showAlarmConfirmation(saved);
@@ -867,7 +879,7 @@ public class MainActivity extends Activity {
                 when.set(Calendar.HOUR_OF_DAY, alarm.optInt("hour")); when.set(Calendar.MINUTE, alarm.optInt("minute"));
                 when.set(Calendar.SECOND, 0); when.set(Calendar.MILLISECOND, 0);
                 if (when.getTimeInMillis() <= System.currentTimeMillis()) {
-                    notice("This date has passed", "Choose a future date or clear the date to use the next occurrence. You can also save this alarm switched off.");
+                    notice("This date has passed", "Choose a future date or clear the date to use the next occurrence.");
                     return false;
                 }
             } catch (Exception e) { notice("Invalid date", "Choose the alarm date again."); return false; }

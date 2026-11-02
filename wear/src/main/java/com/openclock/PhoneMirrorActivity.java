@@ -78,7 +78,7 @@ public final class PhoneMirrorActivity extends Activity {
         update(a);
     }
     @Override public void onBackPressed() {
-        if (!RingingNavigation.backToListIfRoot(this)) super.onBackPressed();
+        complete(false);
     }
     private void update(JSONObject a) {
         Attempt attempt = attempts.get(key);
@@ -90,9 +90,10 @@ public final class PhoneMirrorActivity extends Activity {
         snooze.setContentDescription(available ? "Snooze phone alarm. Swipe right from center, or hold Select" : "Snooze unavailable");
         JSONObject snapshot = PhoneSync.cached(this);
         boolean connected = snapshot != null && snapshot.optBoolean("connected");
-        String message = busy ? "Waiting for phone…" : attempt != null ? "Not confirmed. Refresh or retry."
-                : !connected ? "Phone offline · swipe to try" : available ? "Phone alarm · swipe out" : "Snooze unavailable";
-        if (!message.contentEquals(status.getText())) status.setText(message);
+        String message = busy ? "Waiting for phone…" : attempt != null ? "Not confirmed"
+                : !connected ? "Phone offline" : "";
+        if (!available) message += (message.isEmpty() ? "" : "\n") + "Snooze unavailable";
+        RingingScreen.setStatus(status, message);
     }
     private void complete(boolean wantSnooze) {
         Attempt existing = attempts.get(key); if (existing != null && existing.pending) return;

@@ -30,6 +30,8 @@ final class RingingScreen extends FrameLayout {
     final SwipeButton dismiss;
     final SwipeButton snooze;
     private final LinearLayout content;
+    private final TextView heading;
+    private final LinearLayout buttons;
 
     RingingScreen(Activity activity, String label, String time) {
         super(activity);
@@ -41,18 +43,18 @@ final class RingingScreen extends FrameLayout {
         addView(content, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
 
-        TextView heading = text(label, 15, 0xffeee6fa);
+        heading = text(label, 15, 0xffeee6fa);
         heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        heading.setSingleLine(true);
+        heading.setMaxLines(2);
         heading.setEllipsize(TextUtils.TruncateAt.END);
         heading.setAutoSizeTextTypeUniformWithConfiguration(9, 15, 1, TypedValue.COMPLEX_UNIT_SP);
-        content.addView(heading, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(20)));
+        content.addView(heading, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)));
 
         TextView clock = text(time, 46, Color.WHITE);
         clock.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         clock.setFontFeatureSettings("tnum");
         clock.setSingleLine(true);
-        clock.setAutoSizeTextTypeUniformWithConfiguration(16, 46, 1, TypedValue.COMPLEX_UNIT_SP);
+        clock.setAutoSizeTextTypeUniformWithConfiguration(9, 46, 1, TypedValue.COMPLEX_UNIT_SP);
         content.addView(clock, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
         status = text("", 11, 0xffeee6fa);
@@ -60,9 +62,10 @@ final class RingingScreen extends FrameLayout {
         status.setEllipsize(TextUtils.TruncateAt.END);
         status.setAutoSizeTextTypeUniformWithConfiguration(8, 11, 1, TypedValue.COMPLEX_UNIT_SP);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        content.addView(status, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(26)));
+        status.setVisibility(View.GONE);
+        content.addView(status, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30)));
 
-        LinearLayout buttons = new LinearLayout(activity);
+        buttons = new LinearLayout(activity);
         // Keep outward directions tied to physical screen sides even in RTL locales.
         buttons.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         buttons.setGravity(Gravity.CENTER);
@@ -72,7 +75,13 @@ final class RingingScreen extends FrameLayout {
         LinearLayout.LayoutParams snoozeParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1);
         snoozeParams.leftMargin = dp(4);
         buttons.addView(snooze, snoozeParams);
-        content.addView(buttons, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+        content.addView(buttons, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
+    }
+
+    static void setStatus(TextView status, String message) {
+        int visibility = message.isEmpty() ? View.GONE : View.VISIBLE;
+        if (status.getVisibility() != visibility) status.setVisibility(visibility);
+        if (!message.contentEquals(status.getText())) status.setText(message);
     }
 
     private TextView text(String value, int sp, int color) {
@@ -100,7 +109,7 @@ final class RingingScreen extends FrameLayout {
         button.setAutoSizeTextTypeUniformWithConfiguration(9, 13, 1, TypedValue.COMPLEX_UNIT_SP);
         GradientDrawable shape = new GradientDrawable();
         shape.setColor(background);
-        shape.setCornerRadius(dp(24));
+        shape.setCornerRadius(dp(26));
         button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x66ffffff), shape, null));
         return button;
     }
@@ -277,6 +286,11 @@ final class RingingScreen extends FrameLayout {
         // Measure the actual child before layout, rather than changing its 1px
         // placeholder LayoutParams in onSizeChanged after it has been measured.
         int side = Math.max(0, (int) (Math.min(getMeasuredWidth(), getMeasuredHeight()) * .70f));
+        // Bound every fixed row to the inscribed square, leaving at least 15%
+        // for the weighted clock even when an important two-line status is shown.
+        heading.getLayoutParams().height = Math.min(dp(38), (int) (side * .27f));
+        status.getLayoutParams().height = Math.min(dp(30), (int) (side * .22f));
+        buttons.getLayoutParams().height = Math.min(dp(52), (int) (side * .36f));
         int exact = MeasureSpec.makeMeasureSpec(side, MeasureSpec.EXACTLY);
         content.measure(exact, exact);
     }

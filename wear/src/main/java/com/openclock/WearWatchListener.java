@@ -13,17 +13,21 @@ public final class WearWatchListener extends WearableListenerService {
             String path=e.getDataItem().getUri().getPath();
             if(path!=null&&path.startsWith("/openclock/v1/")) {
                 PhoneSyncRepair.schedule(this,false);
-                PhoneSync.fromListener(this,false); break;
+                PhoneSync.fromListener(this,false);
+                ComplicationUpdateJob.changed(this,false); break;
             }
         }
     }
     @Override public void onMessageReceived(MessageEvent e) {
         PhoneSync.reply(this,e.getSourceNodeId(),e.getPath(),e.getData());
+        ComplicationUpdateJob.changed(this,false);
     }
     @Override public void onCapabilityChanged(CapabilityInfo info) {
         if ("openclock_phone_v1".equals(info.getName())) {
+            PhoneSync.capabilityChanged(this);
             PhoneSyncRepair.schedule(this,true);
             PhoneSync.fromListener(this,true);
+            ComplicationUpdateJob.changed(this,false);
         }
     }
 }

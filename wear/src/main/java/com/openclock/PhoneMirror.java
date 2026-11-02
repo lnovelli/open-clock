@@ -256,7 +256,9 @@ public final class PhoneMirror {
             Notification.Builder b = new Notification.Builder(c, channel).setSmallIcon(R.drawable.ic_alarm)
                     .setContentTitle(label).setContentText("Phone alarm · Tap for controls")
                     .setCategory(Notification.CATEGORY_ALARM).setVisibility(Notification.VISIBILITY_PUBLIC)
-                    .setOnlyAlertOnce(true).setContentIntent(open).setTimeoutAfter(remaining);
+                    .setOnlyAlertOnce(true).setContentIntent(open).setTimeoutAfter(remaining)
+                    .setDeleteIntent(notificationAction(c, a, "fallback_delete"))
+                    .addAction(new Notification.Action.Builder(null, "Dismiss", notificationAction(c, a, "dismiss")).build());
             nm.notify(tag(a) + ":fallback", ALERT_ID, b.build());
         } catch (RuntimeException ignored) { }
     }
@@ -285,6 +287,15 @@ public final class PhoneMirror {
     static PendingIntent open(Context c, JSONObject a) {
         return PendingIntent.getActivity(c, 0, openIntent(c, a), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
+    private static PendingIntent notificationAction(Context c, JSONObject a, String source) {
+        String action = "dismiss".equals(source) ? "com.openclock.MIRROR_DISMISS"
+                : "fallback_delete".equals(source) ? "com.openclock.MIRROR_FALLBACK_DELETE"
+                : "com.openclock.MIRROR_DELETE";
+        Intent intent = new Intent(c, MirrorNotificationReceiver.class).setAction(action)
+                .setData(Uri.parse("openclock://mirror-action/" + a.optLong("id") + "/" + a.optString("token") + "/" + source))
+                .putExtra("id", a.optLong("id")).putExtra("token", a.optString("token"));
+        return PendingIntent.getBroadcast(c, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
     static void post(Context c, JSONObject a, long remaining) {
         if (remaining <= 0) return;
         try {
@@ -293,7 +304,9 @@ public final class PhoneMirror {
             Notification.Builder b = new Notification.Builder(c, CHANNEL).setSmallIcon(R.drawable.ic_alarm)
                     .setContentTitle(label).setContentText("Phone alarm · Tap for controls")
                     .setCategory(Notification.CATEGORY_ALARM).setVisibility(Notification.VISIBILITY_PUBLIC)
-                    .setOngoing(true).setOnlyAlertOnce(true).setContentIntent(open).setTimeoutAfter(remaining);
+                    .setOngoing(true).setOnlyAlertOnce(true).setContentIntent(open).setTimeoutAfter(remaining)
+                    .setDeleteIntent(notificationAction(c, a, "delete"))
+                    .addAction(new Notification.Action.Builder(null, "Dismiss", notificationAction(c, a, "dismiss")).build());
             NotificationManager nm = c.getSystemService(NotificationManager.class);
             nm.notify(tag(a), ALERT_ID, b.build());
         } catch (RuntimeException ignored) { /* notification permission/channel may be blocked */ }

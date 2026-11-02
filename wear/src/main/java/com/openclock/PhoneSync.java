@@ -43,7 +43,9 @@ public final class PhoneSync {
     private static volatile boolean lastReadComplete;
     private static JSONObject snapshot;
     private static String owner="", reachable="";
-    private static long connectedUntil, lastDiscovery;
+    private static long connectedUntil, complicationConfirmedUntil, lastDiscovery;
+    // Failure to record advisory complication state must never block alarm controls.
+    private static boolean complicationBarrierFailed;
     private static Pending pending;
     private static final class Pending {
         final String id,node; final Callback callback;
@@ -72,8 +74,50 @@ public final class PhoneSync {
         if(lastDiscovery==0||now-lastDiscovery>20_000) { lastDiscovery=Math.max(1,now); startFetch(c,false); }
         return snapshot;
     }
+    // A provider read must never trigger discovery or a publication feedback loop.
+    static synchronized JSONObject complicationSnapshot(Context context) {
+        load(context.getApplicationContext());
+        try {
+            JSONObject copy = new JSONObject(snapshot.toString());
+            long left = !owner.isEmpty() && owner.equals(reachable)
+                    ? Math.max(0, complicationConfirmedUntil - SystemClock.elapsedRealtime()) : 0;
+            JSONObject creation = pendingCreate(context), mutation = pendingMutation(context);
+            boolean unresolved = complicationBarrierFailed || pending != null || commandPrefs(context).contains("barrier")
+                    || !createActive.isEmpty() || !mutationActive.isEmpty()
+                    || !receiptCovered(creation, "created", copy) || !receiptCovered(mutation, "committed", copy);
+            copy.put("connectedForMillis", unresolved ? 0 : left);
+            copy.put("complicationUnresolved", unresolved);
+            return copy;
+        } catch (Exception e) { return null; }
+    }
+    private static boolean receiptCovered(JSONObject receipt, String status, JSONObject copy) {
+        return receipt == null || (status.equals(receipt.optString("status"))
+                && !owner.isEmpty() && owner.equals(receipt.optString("node"))
+                && copy.optString("epoch").equals(receipt.optString("epoch"))
+                && receipt.optLong("revision", -1) >= 0
+                && copy.optLong("revision", -1) >= receipt.optLong("revision"));
+    }
+    private static SharedPreferences commandPrefs(Context c) {
+        return c.getApplicationContext().getSharedPreferences("complication-command-v1", Context.MODE_PRIVATE);
+    }
+    // Unknown outcomes require a phone snapshot after the bounded command window;
+    // a merely newer revision is not sufficient.
+    private static void coverCommand(Context c, JSONObject copy) {
+        try {
+            if(pending!=null) return;
+            SharedPreferences p=commandPrefs(c); String raw=p.getString("barrier", "");
+            if(raw.isEmpty()) return;
+            JSONObject b=new JSONObject(raw);
+            if(ComplicationPolicy.commandCovered(b,owner,copy))
+                p.edit().remove("barrier").commit();
+        } catch(Exception ignored) { }
+    }
     public static void requestSnapshot(Context context) { startFetch(context.getApplicationContext(),true); }
     static void changed(Context c) { startFetch(c.getApplicationContext(),false); }
+    static void capabilityChanged(Context c) {
+        synchronized (PhoneSync.class) { complicationConfirmedUntil=0; }
+        broadcast(c.getApplicationContext());
+    }
     // Called on the WearableListenerService background thread. Keep its binding
     // alive for a bounded fetch rather than returning immediately after enqueue.
     static boolean fromListener(Context context, boolean request) {
@@ -90,7 +134,10 @@ public final class PhoneSync {
         } catch (InterruptedException stopped) { Thread.currentThread().interrupt(); return false; }
         catch (Exception ignored) { return false; /* A later event or job retries. */ }
     }
-    private static void broadcast(Context c) { MAIN.post(()->c.sendBroadcast(new Intent(ACTION_CHANGED).setPackage(c.getPackageName()))); }
+    private static void broadcast(Context c) { MAIN.post(()->{
+        c.sendBroadcast(new Intent(ACTION_CHANGED).setPackage(c.getPackageName()));
+        ComplicationUpdateJob.changed(c, false);
+    }); }
     private static void startFetch(Context c,boolean request) {
         if(request) wantsRequest.set(true);
         if(!fetching.compareAndSet(false,true)) { dirty.set(true); return; }
@@ -116,6 +163,7 @@ public final class PhoneSync {
         try { node=onePhone(c); discoverySucceeded=true; } catch(Exception ignored) { }
         synchronized(PhoneSync.class) {
             load(c); reachable=node; connectedUntil=SystemClock.elapsedRealtime()+30_000;
+            complicationConfirmedUntil=0;
             if(!node.isEmpty()&&!owner.isEmpty()&&!owner.equals(node)) {
                 owner=""; snapshot=empty(); prefs(c).edit().clear().apply();
             }
@@ -162,6 +210,12 @@ public final class PhoneSync {
             // Finish mirror persistence and notification admission while the listener
             // or repair job still owns its background execution lifetime.
             lastReadComplete=PhoneMirror.onSnapshot(c,next);
+            synchronized(PhoneSync.class) {
+                if (lastReadComplete && snapshot == next && node.equals(reachable) && node.equals(owner)) {
+                    complicationConfirmedUntil = SystemClock.elapsedRealtime() + ComplicationPolicy.FRESH_MS;
+                    coverCommand(c,next);
+                }
+            }
             broadcast(c);
         } catch(Exception ignored) { }
     }
@@ -193,16 +247,41 @@ public final class PhoneSync {
             synchronized(PhoneSync.class) {
                 load(c); if(pending!=null||reachable.isEmpty()||!reachable.equals(owner)||SystemClock.elapsedRealtime()>=connectedUntil) throw new IllegalStateException();
                 node=owner; rev=snapshot.getLong("revision"); epoch=snapshot.getString("epoch"); id=UUID.randomUUID().toString();
+                try {
+                    SharedPreferences cp=commandPrefs(c);
+                    JSONObject previous=cp.contains("barrier") ? new JSONObject(cp.getString("barrier","{}")) : null;
+                    JSONObject barrier=new JSONObject().put("id",id).put("node",node).put("epoch",epoch)
+                            .put("revision",rev).put("ack",false).put("safeAfter",System.currentTimeMillis()+60_000L);
+                    if(previous!=null) {
+                        barrier.put("overlap",true);
+                        if(node.equals(previous.optString("node")) && epoch.equals(previous.optString("epoch")))
+                            barrier.put("safeAfter",Math.max(barrier.getLong("safeAfter"),previous.optLong("safeAfter",Long.MAX_VALUE)));
+                        else barrier.put("safeAfter",Long.MAX_VALUE);
+                    }
+                    if(!cp.edit().putString("barrier",barrier.toString()).commit()) complicationBarrierFailed=true;
+                } catch(Exception failure) { complicationBarrierFailed=true; }
                 pending=new Pending(id,node,callback);
             }
         } catch(Exception e) { MAIN.post(()->callback.onResult(false,"Phone unavailable or snapshot not ready; refresh")); return; }
+        broadcast(c);
         MAIN.postDelayed(()->finish(c,id,false,"Result unknown; refresh on watch"),25_000);
         SEND.execute(()->{
             try {
                 if(!node.equals(onePhone(c))) { finish(c,id,false,"Phone unavailable; refresh on watch"); return; }
-                synchronized(PhoneSync.class) { if(pending==null||!id.equals(pending.id)) return; }
+                long issued;
+                synchronized(PhoneSync.class) {
+                    if(pending==null||!id.equals(pending.id)) return;
+                    issued=System.currentTimeMillis();
+                    try {
+                        SharedPreferences cp=commandPrefs(c); JSONObject b=new JSONObject(cp.getString("barrier","{}"));
+                        if(id.equals(b.optString("id"))) {
+                            b.put("safeAfter",Math.max(b.optLong("safeAfter",Long.MAX_VALUE),issued+60_000L));
+                            if(!cp.edit().putString("barrier",b.toString()).commit()) complicationBarrierFailed=true;
+                        }
+                    } catch(Exception failure) { complicationBarrierFailed=true; }
+                }
                 JSONObject cmd=new JSONObject().put("op",op).put("id",alarm)
-                    .put("epoch",epoch).put("requestId",id).put("issuedAt",System.currentTimeMillis());
+                    .put("epoch",epoch).put("requestId",id).put("issuedAt",issued);
                 if("setEnabled".equals(op)) cmd.put("enabled",value).put("revision",rev);
                 else cmd.put("token",token).put("snooze",value);
                 Wearable.getMessageClient(c).sendMessage(node,COMMAND,cmd.toString().getBytes(StandardCharsets.UTF_8))
@@ -228,7 +307,9 @@ public final class PhoneSync {
     public static synchronized boolean forgetCreate(Context context,String requestId) {
         JSONObject p=pendingCreate(context);
         if(p==null||!p.optString("requestId").equals(requestId)||!createActive.isEmpty()) return false;
-        return createPrefs(context).edit().remove("request").commit();
+        boolean removed=createPrefs(context).edit().remove("request").commit();
+        if(removed) broadcast(context.getApplicationContext());
+        return removed;
     }
     /**
      * Create one phone-owned, enabled, non-repeating alarm. Fields: integer hour/minute;
@@ -270,6 +351,7 @@ public final class PhoneSync {
                 if(!createPrefs(c).edit().putString("request",record.toString()).commit()) throw new IllegalStateException();
                 createActive=id; createNonce=nonce; createCallback=callback; createAttempt++;
             }
+            broadcast(c);
             java.io.ByteArrayOutputStream bytes=new java.io.ByteArrayOutputStream();
             java.io.DataOutputStream out=new java.io.DataOutputStream(bytes);
             out.writeByte(1); out.writeUTF(id); out.writeUTF(epoch); out.writeUTF(nonce); out.writeLong(issued);
@@ -300,6 +382,7 @@ public final class PhoneSync {
                 }
                 createActive=id; createNonce=nonce; createCallback=callback; createAttempt++;
             }
+            broadcast(c);
             java.io.ByteArrayOutputStream bytes=new java.io.ByteArrayOutputStream();
             java.io.DataOutputStream out=new java.io.DataOutputStream(bytes);
             out.writeByte(1); out.writeUTF(id); out.writeUTF(epoch); out.writeUTF(nonce); out.writeLong(System.currentTimeMillis()); out.flush();
@@ -395,7 +478,9 @@ public final class PhoneSync {
     public static synchronized boolean forgetMutation(Context context,String requestId) {
         JSONObject p=pendingMutation(context);
         if(p==null||!requestId.equals(p.optString("requestId"))||!mutationActive.isEmpty()) return false;
-        return mutationPrefs(context).edit().remove("request").commit();
+        boolean removed=mutationPrefs(context).edit().remove("request").commit();
+        if(removed) broadcast(context.getApplicationContext());
+        return removed;
     }
     /** Patch only supplied fields; never retry the write after uncertain dispatch. */
     public static void editAlarm(Context context,JSONObject target,JSONObject patch,MutationCallback callback) {
@@ -437,6 +522,7 @@ public final class PhoneSync {
                 if(!mutationPrefs(c).edit().putString("request",record.toString()).commit()) throw new IllegalStateException();
                 mutationActive=id; mutationNonce=nonce; mutationCallback=callback; mutationAttempt++; armed=true;
             }
+            broadcast(c);
             sendMutation(c,id,node,epoch,MUTATE,body);
         } catch(Exception e) {
             synchronized(PhoneSync.class) { if(armed&&id.equals(mutationActive)) { completeMutation(c,id,"unknown",0,0); return; } }
@@ -476,6 +562,7 @@ public final class PhoneSync {
                 if(!node.equals(owner)||!node.equals(reachable)||!epoch.equals(snapshot.optString("epoch"))||SystemClock.elapsedRealtime()>=connectedUntil) throw new IllegalStateException();
                 mutationActive=id; mutationNonce=nonce; mutationCallback=callback; mutationAttempt++; armed=true;
             }
+            broadcast(c);
             java.io.ByteArrayOutputStream bytes=new java.io.ByteArrayOutputStream();
             java.io.DataOutputStream out=new java.io.DataOutputStream(bytes);
             out.writeByte(1); out.writeUTF(id); out.writeUTF(epoch); out.writeUTF(nonce); out.writeLong(System.currentTimeMillis()); out.flush();
@@ -554,17 +641,29 @@ public final class PhoneSync {
                 if(pending==null||!pending.node.equals(node)||!pending.id.equals(id)) return;
                 if(!node.equals(owner)||!node.equals(reachable)) ok=false;
             }
-            finish(context.getApplicationContext(),id,ok,ok?"Phone alarm updated":"Phone change not confirmed; refresh on watch");
+            long committedRevision = result.opt("revision") instanceof Number ? result.optLong("revision",-1) : -1;
+            finish(context.getApplicationContext(),id,ok,ok?"Phone alarm updated":"Phone change not confirmed; refresh on watch",committedRevision);
         } catch(Exception ignored) { }
     }
     private static void finish(Context c,String id,boolean ok,String message) {
+        finish(c,id,ok,message,-1);
+    }
+    private static void finish(Context c,String id,boolean ok,String message,long committedRevision) {
         Callback callback;
         synchronized(PhoneSync.class) {
             if(pending==null||!pending.id.equals(id)) return;
             callback=pending.callback; pending=null;
+            if(ok && committedRevision>=0) try {
+                SharedPreferences cp=commandPrefs(c); JSONObject b=new JSONObject(cp.getString("barrier","{}"));
+                if(id.equals(b.optString("id")) && committedRevision>=b.optLong("revision",Long.MAX_VALUE)) {
+                    b.put("ack",true).put("committedRevision",committedRevision);
+                    if(cp.edit().putString("barrier",b.toString()).commit()) coverCommand(c,snapshot);
+                }
+            } catch(Exception ignored) { }
         }
         MAIN.post(()->callback.onResult(ok,message));
-        if(!ok) startFetch(c,true);
+        broadcast(c);
+        startFetch(c,true);
     }
     private PhoneSync() { }
 }

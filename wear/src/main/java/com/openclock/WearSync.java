@@ -16,6 +16,7 @@ final class WearSync {
         main.post(() -> {
             queued.set(false);
             app.sendBroadcast(new android.content.Intent(LOCAL_CHANGED).setPackage(app.getPackageName()));
+            ComplicationUpdateJob.changed(app, false);
         });
     }
     private WearSync() { }

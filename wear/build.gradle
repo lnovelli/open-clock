@@ -7,8 +7,8 @@ android {
         applicationId 'com.openclock'
         minSdk 26
         targetSdk 34
-        versionCode 11
-        versionName '2.0'
+        versionCode 12
+        versionName '2.1'
     }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     buildTypes { release { minifyEnabled false } }
@@ -23,7 +23,7 @@ tasks.register('prepareWatchEngine', Sync) {
         include 'com/openclock/AlarmStore.java', 'com/openclock/AlarmTimes.java',
                 'com/openclock/AlarmReceiver.java', 'com/openclock/RestoreReceiver.java',
                 'com/openclock/AlarmNotifications.java', 'com/openclock/RingingService.java',
-                'com/openclock/ClockApplication.java',
+                'com/openclock/ClockApplication.java', 'com/openclock/AlarmConfirmation.java',
                 'com/openclock/UpdateChecker.java'
         into 'java'
     }
@@ -38,5 +38,6 @@ tasks.named('preBuild').configure { dependsOn tasks.named('prepareWatchEngine') 
 dependencies {
     implementation 'com.google.android.gms:play-services-wearable:18.2.0'
     implementation 'androidx.wear:wear:1.3.0'
+    implementation 'androidx.wear.watchface:watchface-complications-data-source:1.2.1'
 
 }

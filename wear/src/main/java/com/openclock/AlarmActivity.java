@@ -111,7 +111,7 @@ public final class AlarmActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
-        if (!RingingNavigation.backToListIfRoot(this)) super.onBackPressed();
+        complete(false);
     }
 
     private void updateState(JSONObject alarm) {
@@ -123,9 +123,9 @@ public final class AlarmActivity extends Activity {
                 ? "Snooze for " + minutes + (minutes == 1 ? " minute" : " minutes") + ". Swipe right from center, or hold Select"
                 : "Snooze unavailable");
         boolean muted = alarm.optJSONObject("_active").optBoolean("soundMuted");
-        String label = muted ? (available ? "Sound muted" : "Sound muted · Snooze unavailable")
-                : available ? "Swipe outwards" : "Snooze unavailable";
-        if (!label.contentEquals(status.getText())) status.setText(label);
+        String label = muted ? (available ? "Sound muted" : "Sound muted\nSnooze unavailable")
+                : available ? "" : "Snooze unavailable";
+        RingingScreen.setStatus(status, label);
     }
 
     private void complete(boolean snooze) {

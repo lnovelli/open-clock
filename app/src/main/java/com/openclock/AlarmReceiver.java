@@ -14,8 +14,13 @@ public final class AlarmReceiver extends BroadcastReceiver {
                 AlarmPresentation.local(c,id);
                 AlarmStore.recoverRinging(c);
             } else if("com.openclock.DISMISS".equals(action)||"com.openclock.SNOOZE".equals(action)) {
-                AlarmStore.finish(c,id,token,"com.openclock.SNOOZE".equals(action));
-                c.getSystemService(android.app.NotificationManager.class).cancel("alarm:"+id,11);
+                // Reject stale notification actions before either mutating the store or
+                // cancelling the per-alarm notification for a newer occurrence.
+                synchronized(AlarmStore.class) {
+                    if(AlarmStore.active(c,id,token)==null) return;
+                    AlarmStore.finish(c,id,token,"com.openclock.SNOOZE".equals(action));
+                    c.getSystemService(android.app.NotificationManager.class).cancel("alarm:"+id,11);
+                }
                 AlarmStore.refreshService(c);
             }
         } catch(Exception e) { AlarmNotifications.warning(c,AlarmStore.message(e)); }

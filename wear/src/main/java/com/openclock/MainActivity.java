@@ -56,6 +56,7 @@ import java.util.Set;
 
 /** Small, self-contained watch UI. The watch store and phone cache are separate authorities. */
 public class MainActivity extends Activity {
+    static final String ACTION_OPEN_COMPLICATION = "com.openclock.action.OPEN_NEXT_ALARM";
     private static final int BG = Color.BLACK, CARD = 0xff28292d, WHITE = 0xfff3f3f5;
     private static final int MUTED = 0xffbec0c8, BLUE = 0xffa7bfff, RED = 0xffffb4ab;
     private static final long FRESH_MS = 5 * 60 * 1000L;
@@ -76,11 +77,21 @@ public class MainActivity extends Activity {
     private final Set<Long> pending = new HashSet<>();
     private final Map<Long, Long> pendingRefresh = new HashMap<>();
     private final Map<Long, Boolean> pendingExpected = new HashMap<>();
+    private static final class PhoneConfirmation {
+        final String epoch;
+        final long revision;
+        PhoneConfirmation(String epoch, long revision) { this.epoch = epoch; this.revision = revision; }
+    }
+    private final Map<Long, PhoneConfirmation> phoneConfirmations = new HashMap<>();
     private String phoneNotice = "";
     private boolean createBusy;
     private boolean mutationBusy;
     private boolean registered;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private boolean complicationScrollPending;
+    private String complicationScrollKey;
+    private View complicationScrollRow;
+    private final Runnable expireComplicationScroll = () -> complicationScrollPending = false;
     private final Runnable agePhoneSnapshot = new Runnable() {
         @Override public void run() {
             if (!registered) return;
@@ -99,6 +110,7 @@ public class MainActivity extends Activity {
             }
             long updated = snapshot().optLong("updatedAt", 0);
             reconcilePending();
+            reconcilePhoneConfirmations();
             if (awaitingAfter > 0 && updated > awaitingAfter) {
                 awaitingAfter = 0;
                 phoneNotice = "Phone snapshot updated.";
@@ -138,7 +150,48 @@ public class MainActivity extends Activity {
             editingTarget = state.getString("editingTarget", ""); dateChanged = state.getBoolean("dateChanged", false);
             chosenDate = state.getString("chosenDate", "");
         }
+        if (state == null && ACTION_OPEN_COMPLICATION.equals(getIntent().getAction())) beginComplicationScroll();
         render();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (!ACTION_OPEN_COMPLICATION.equals(intent.getAction())) return;
+        if (page != 0) {
+            // Leave an in-progress editor and its draft intact underneath the new list.
+            startActivity(new Intent(this, MainActivity.class).setAction(ACTION_OPEN_COMPLICATION));
+            return;
+        }
+        beginComplicationScroll();
+        render();
+    }
+
+    private void beginComplicationScroll() {
+        complicationScrollPending = true;
+        uiHandler.removeCallbacks(expireComplicationScroll);
+        uiHandler.postDelayed(expireComplicationScroll, 5_000L);
+    }
+
+    @Override public boolean dispatchTouchEvent(MotionEvent event) {
+        if (event.getActionMasked() == MotionEvent.ACTION_DOWN && complicationScrollPending) {
+            complicationScrollPending = false;
+            uiHandler.removeCallbacks(expireComplicationScroll);
+        }
+        return super.dispatchTouchEvent(event);
+    }
+
+    private String nextKnownAlarmKey() {
+        ComplicationPolicy.Selection selection = new ComplicationPolicy.Selection();
+        long now = System.currentTimeMillis();
+        try {
+            JSONObject local = AlarmStore.wearSnapshot(this);
+            selection.rows("watch", local.getJSONArray("alarms"), local.getJSONArray("active"), now);
+        } catch (Exception ignored) { }
+        try {
+            JSONObject phone = PhoneSync.complicationSnapshot(this);
+            if (phone != null) selection.rows("phone", phone.getJSONArray("alarms"), phone.getJSONArray("active"), now);
+        } catch (Exception ignored) { }
+        return selection.firstKey();
     }
 
     @Override protected void onStart() {
@@ -160,6 +213,8 @@ public class MainActivity extends Activity {
 
     @Override protected void onStop() {
         uiHandler.removeCallbacks(agePhoneSnapshot);
+        uiHandler.removeCallbacks(expireComplicationScroll);
+        complicationScrollPending = false;
         if (registered) { unregisterReceiver(phoneChanged); registered = false; }
         super.onStop();
     }
@@ -226,6 +281,8 @@ public class MainActivity extends Activity {
     }
     private void render() {
         final int oldScroll = scroll != null && page == renderedPage ? scroll.getScrollY() : 0;
+        complicationScrollKey = page == 0 && complicationScrollPending ? nextKnownAlarmKey() : null;
+        complicationScrollRow = null;
         if (page == 0) renderedListState = listStateKey();
         renderedPage = page;
         getWindow().getDecorView().setSystemUiVisibility(page == 0 ? 0 :
@@ -255,7 +312,24 @@ public class MainActivity extends Activity {
         swipeRoot = root;
         setContentView(root);
         if (page == 0) list(); else if (page == 1) timePage(); else optionsPage();
-        if (oldScroll > 0 && scroll != null) scroll.post(() -> scroll.scrollTo(0, oldScroll));
+        if (scroll != null && complicationScrollPending && complicationScrollRow != null) {
+            final ScrollView listScroll = scroll;
+            final View target = complicationScrollRow;
+            listScroll.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+                @Override public boolean onPreDraw() {
+                    if (listScroll.getViewTreeObserver().isAlive()) listScroll.getViewTreeObserver().removeOnPreDrawListener(this);
+                    if (complicationScrollPending && page == 0 && scroll == listScroll && target.isAttachedToWindow()) {
+                        complicationScrollPending = false;
+                        uiHandler.removeCallbacks(expireComplicationScroll);
+                        listScroll.scrollTo(0, target.getTop() - (listScroll.getHeight() - target.getHeight()) / 2);
+                    }
+                    return true;
+                }
+            });
+        } else if (oldScroll > 0 && scroll != null && !complicationScrollPending) {
+            final ScrollView listScroll = scroll;
+            listScroll.post(() -> { if (scroll == listScroll && !complicationScrollPending) listScroll.scrollTo(0, oldScroll); });
+        }
     }
     private void title(String s) { TextView t = text(s, 24, WHITE, true); t.setGravity(Gravity.CENTER); add(t, 0); }
     private void section(String s) { TextView t = text(s, 16, WHITE, true); add(t, 20); }
@@ -447,7 +521,8 @@ public class MainActivity extends Activity {
                 if (page > 0 && request.equals(new JSONObject(editingTarget).optString("requestId"))) page = 0;
             } catch (Exception ignored) { }
         }
-        render(); toast(phoneNotice);
+        render();
+        if (!editing || !"committed".equals(status)) toast(phoneNotice);
     }
 
     private void beginCreate(boolean phone) {
@@ -531,6 +606,9 @@ public class MainActivity extends Activity {
 
     private View alarmRow(JSONObject a, boolean phone) {
         LinearLayout row = new DeleteSwipeRow(a, phone); row.setGravity(Gravity.CENTER_VERTICAL);
+        if (complicationScrollPending && complicationScrollRow == null
+                && ((phone ? "phone:" : "watch:") + a.optLong("id", -1)).equals(complicationScrollKey))
+            complicationScrollRow = row;
         row.setPadding(dp(14), dp(8), dp(8), dp(8)); row.setMinimumHeight(dp(66)); row.setBackground(shape(CARD, 26));
         LinearLayout details = column(); details.setGravity(Gravity.CENTER_VERTICAL);
         TextView time = text(String.format(Locale.getDefault(), "%02d:%02d", a.optInt("hour"), a.optInt("minute")), 22, WHITE, true);
@@ -562,7 +640,10 @@ public class MainActivity extends Activity {
                 button.setOnCheckedChangeListener(null); button.setChecked(old);
                 phoneToggle(id, checked);
             } else {
-                try { AlarmStore.saveAlarm(this, new JSONObject().put("id", id).put("enabled", checked)); }
+                try {
+                    JSONObject saved = AlarmStore.saveAlarm(this, new JSONObject().put("id", id).put("enabled", checked));
+                    if (checked) showAlarmConfirmation(saved, false);
+                }
                 catch (Exception e) { toast(AlarmStore.message(e)); }
                 render();
             }
@@ -782,9 +863,13 @@ public class MainActivity extends Activity {
     private void phoneToggle(long id, boolean enabled) {
         if (id <= 0 || !connected(snapshot())) { phoneNotice = "Phone unavailable; change not sent."; render(); return; }
         try {
-            final long baseRevision = snapshot().optLong("revision", -1);
             JSONObject command = new JSONObject().put("op", "setEnabled").put("id", id).put("enabled", enabled);
             pending.add(id); pendingExpected.put(id, enabled); phoneNotice = "Change pending on phone…"; render();
+            synchronized (PhoneSync.class) {
+            // Capture the same epoch and revision that command() will send.
+            JSONObject base = snapshot();
+            final long baseRevision = base.optLong("revision", -1);
+            final String epoch = base.optString("epoch", "");
             PhoneSync.command(this, command, (ok, safeMessage) -> {
                 if (ok) {
                     phoneNotice = "Phone accepted the request; awaiting a fresh snapshot.";
@@ -792,6 +877,7 @@ public class MainActivity extends Activity {
                     pendingRefresh.put(id, baseRevision);
                     // The updated snapshot may arrive before the acknowledgement.
                     reconcilePending();
+                    if (enabled) queuePhoneConfirmation(id, epoch, baseRevision + 1);
                     if (!pending.contains(id)) phoneNotice = "Phone alarm updated.";
                     try { if (connected(snapshot())) PhoneSync.requestSnapshot(this); }
                     catch (Exception e) { phoneNotice = "Phone accepted the request; refresh unavailable. Cached state may be stale."; }
@@ -808,6 +894,7 @@ public class MainActivity extends Activity {
                 }
                 if (!isFinishing() && !isDestroyed() && page == 0) render();
             });
+            }
         } catch (Exception e) { pending.remove(id); pendingRefresh.remove(id); pendingExpected.remove(id); phoneNotice = "Phone change could not be sent."; render(); }
     }
 
@@ -981,9 +1068,9 @@ public class MainActivity extends Activity {
         } catch (Exception e) { return true; }
     }
     private void saveEdit(LocalDate date) throws Exception {
-        if (!editChanged()) { page = 0; render(); return; }
         JSONObject original = new JSONObject(editingOriginal);
-        JSONObject patch = new JSONObject().put("id", editingId);
+        if (!editChanged() && original.optBoolean("enabled", false)) { page = 0; render(); return; }
+        JSONObject patch = new JSONObject().put("id", editingId).put("enabled", true);
         if (hour != original.getInt("hour")) patch.put("hour", hour);
         if (minute != original.getInt("minute")) patch.put("minute", minute);
         if (!label.trim().equals(original.optString("label", "").trim())) patch.put("label", label.trim());
@@ -994,6 +1081,7 @@ public class MainActivity extends Activity {
             if (date != null) patch.put("days", new JSONArray());
         }
         if (createOnPhone) { savePhoneEdit(patch); return; }
+        JSONObject saved;
         synchronized (AlarmStore.class) {
             JSONArray alarms = AlarmStore.alarms(this); JSONObject current = null;
             for (int i = 0; i < alarms.length(); i++) {
@@ -1002,9 +1090,9 @@ public class MainActivity extends Activity {
             }
             if (current == null || !sameEditableAlarm(original, current))
                 throw new IllegalStateException("Alarm changed; return to the list and reopen it");
-            AlarmStore.saveAlarm(this, patch);
+            saved = AlarmStore.saveAlarm(this, patch);
         }
-        page = 0; render(); toast("Watch alarm updated");
+        page = 0; render(); showAlarmConfirmation(saved, false);
     }
     private boolean sameEditableAlarm(JSONObject a, JSONObject b) {
         for (String key : new String[]{"hour", "minute", "label", "sound", "vibrate", "date", "days",
@@ -1017,8 +1105,10 @@ public class MainActivity extends Activity {
         JSONObject target = new JSONObject(editingTarget);
         JSONObject patch = new JSONObject(withId.toString()); patch.remove("id");
         mutationBusy = true; render();
-        PhoneSync.editAlarm(getApplicationContext(), target, patch, (status, request, alarm, revision) ->
-                finishPhoneMutation(status, request, true));
+        PhoneSync.editAlarm(getApplicationContext(), target, patch, (status, request, alarm, revision) -> {
+            finishPhoneMutation(status, request, true);
+            if ("committed".equals(status)) queuePhoneConfirmation(alarm, target.optString("epoch", ""), revision);
+        });
     }
     private void deletePhoneAlarm(JSONObject target) {
         if (mutationBlocked()) { toast("Check the previous phone change first"); return; }
@@ -1048,7 +1138,14 @@ public class MainActivity extends Activity {
             }
             if (!isFinishing() && !isDestroyed()) {
                 if (page == 0 || (page == 2 && createOnPhone)) render();
-                toast(phoneNotice);
+                if ("created".equals(result)) {
+                    try {
+                        JSONObject receipt = PhoneSync.pendingCreate(this);
+                        if (receipt != null && requestId.equals(receipt.optString("requestId")))
+                            queuePhoneConfirmation(alarmId, receipt.optString("epoch", ""), revision);
+                        else toast(phoneNotice);
+                    } catch (RuntimeException ignored) { toast(phoneNotice); }
+                } else toast(phoneNotice);
             }
         });
         JSONObject current = PhoneSync.pendingCreate(this);
@@ -1061,9 +1158,55 @@ public class MainActivity extends Activity {
             JSONObject a = new JSONObject().put("hour", hour).put("minute", minute).put("label", label.trim())
                 .put("date", date == null ? JSONObject.NULL : date.toString()).put("days", new JSONArray())
                 .put("sound", sound).put("vibrate", vibrate).put("enabled", true).put("groupId", JSONObject.NULL);
-            AlarmStore.saveAlarm(this, a);
-            page = 0; render(); toast(date == null ? "Watch alarm saved" : "Watch alarm saved for " + date.format(DateTimeFormatter.ISO_LOCAL_DATE));
+            JSONObject saved = AlarmStore.saveAlarm(this, a);
+            page = 0; render(); showAlarmConfirmation(saved, false);
         } catch (Exception e) { toast(AlarmStore.message(e)); }
+    }
+    // Phone acknowledgements do not carry the committed trigger: wait for a
+    // matching, sufficiently recent snapshot, which can arrive before the ack.
+    private void queuePhoneConfirmation(long id, String epoch, long revision) {
+        if (isFinishing() || isDestroyed() || id <= 0 || epoch.isEmpty() || revision < 0) return;
+        PhoneConfirmation confirmation = new PhoneConfirmation(epoch, revision);
+        phoneConfirmations.put(id, confirmation);
+        reconcilePhoneConfirmations();
+        uiHandler.postDelayed(() -> {
+            if (phoneConfirmations.get(id) == confirmation) {
+                phoneConfirmations.remove(id);
+                if (registered && !isFinishing() && !isDestroyed())
+                    toast("Phone confirmed; next trigger unavailable. Check the alarm list.");
+            }
+        }, 15_000L);
+    }
+    private void reconcilePhoneConfirmations() {
+        JSONObject current = snapshot();
+        JSONArray alarms = current.optJSONArray("alarms");
+        if (alarms == null) return;
+        java.util.Iterator<Map.Entry<Long, PhoneConfirmation>> it = phoneConfirmations.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<Long, PhoneConfirmation> entry = it.next();
+            PhoneConfirmation confirmation = entry.getValue();
+            if (!confirmation.epoch.equals(current.optString("epoch", ""))
+                    || current.optLong("revision", -1) < confirmation.revision) continue;
+            JSONObject match = null;
+            for (int i = 0; i < alarms.length(); i++) {
+                JSONObject alarm = alarms.optJSONObject(i);
+                if (alarm != null && alarm.optLong("id", -1) == entry.getKey()) { match = alarm; break; }
+            }
+            it.remove();
+            if (match != null && match.optBoolean("enabled")) showAlarmConfirmation(match, true);
+        }
+    }
+    private void showAlarmConfirmation(JSONObject alarm, boolean phone) {
+        String message = null;
+        try {
+            long now = System.currentTimeMillis();
+            if ((phone || AlarmStore.accessProblem(this) == null) && alarm != null
+                    && alarm.optBoolean("enabled") && alarm.isNull("schedulingError"))
+                message = AlarmConfirmation.message(alarm.optLong("nextTriggerAt", 0), now,
+                        ZoneId.systemDefault(), Locale.getDefault());
+        } catch (RuntimeException ignored) { /* Save succeeded; formatting must not report it as failed. */ }
+        toast(message == null ? (phone ? "Phone alarm" : "Watch alarm")
+                + " saved; next trigger unavailable. Check the alarm list." : message);
     }
     private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_LONG).show(); }
 }
