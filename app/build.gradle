@@ -2,7 +2,7 @@ plugins { id 'com.android.application' }
 android {
     namespace 'com.openclock'
     compileSdk 34
-    defaultConfig { applicationId 'com.openclock'; minSdk 26; targetSdk 34; versionCode 12; versionName '2.1' }
+    defaultConfig { applicationId 'com.openclock'; minSdk 26; targetSdk 34; versionCode 14; versionName '2.2' }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     buildTypes { release { minifyEnabled false } }
 }

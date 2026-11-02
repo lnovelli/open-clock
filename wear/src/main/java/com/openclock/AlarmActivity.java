@@ -99,7 +99,8 @@ public final class AlarmActivity extends Activity {
         String name = alarm.optString("label", "").trim();
         long startedAt = alarm.optJSONObject("_active").optLong("startedAt", System.currentTimeMillis());
         String time = android.text.format.DateFormat.getTimeFormat(this).format(new Date(startedAt));
-        RingingScreen screen = new RingingScreen(this, name.isEmpty() ? "Alarm" : name, time);
+        String title = alarm.optBoolean("_phoneFallback") ? (name.isEmpty() ? "Phone fallback" : "Phone fallback: " + name) : (name.isEmpty() ? "Alarm" : name);
+        RingingScreen screen = new RingingScreen(this, title, time);
         status = screen.status;
         dismissButton = screen.dismiss;
         snoozeButton = screen.snooze;
@@ -125,6 +126,7 @@ public final class AlarmActivity extends Activity {
         boolean muted = alarm.optJSONObject("_active").optBoolean("soundMuted");
         String label = muted ? (available ? "Sound muted" : "Sound muted\nSnooze unavailable")
                 : available ? "" : "Snooze unavailable";
+        if (alarm.optBoolean("_phoneFallback")) label = "Watch copy only" + (label.isEmpty() ? "" : "\n" + label);
         RingingScreen.setStatus(status, label);
     }
 

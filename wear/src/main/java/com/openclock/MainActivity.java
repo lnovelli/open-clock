@@ -823,6 +823,9 @@ public class MainActivity extends Activity {
     private void phoneList() {
         JSONObject cache = snapshot(); boolean online = connected(cache); long updated = cache.optLong("updatedAt", 0);
         long age = System.currentTimeMillis() - updated;
+        String fallbackProblem = PhoneFallback.problem(this);
+        if (!fallbackProblem.isEmpty()) note("Watch phone-alarm fallback problem: " + fallbackProblem);
+        else note("Watch schedules phone alarms independently from the last snapshot, even offline. Changes may be stale; both devices may ring. Dismiss/snooze separately.");
         if (!online) note("Phone unavailable. Cached alarms may be stale; controls are disabled.");
         else if (updated <= 0 || age < 0 || age > FRESH_MS) note("Phone connected · snapshot is stale or not yet available.");
 

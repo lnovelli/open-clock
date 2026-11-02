@@ -25,7 +25,7 @@ import java.util.zip.GZIPInputStream;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** Advisory phone snapshot; local watch alarms use their own AlarmStore. */
+/** Phone snapshot and commands. The watch also schedules independent fallback alarms. */
 public final class PhoneSync {
     public static final String ACTION_CHANGED="com.openclock.PHONE_SYNC_CHANGED";
     public interface Callback { void onResult(boolean ok,String safeMessage); }
@@ -58,11 +58,19 @@ public final class PhoneSync {
             SharedPreferences p=prefs(c); owner=p.getString("owner","");
             String raw=p.getString("snapshot","");
             snapshot=raw.length()<=MAX_RAW&&!raw.isEmpty()?new JSONObject(raw):empty();
+            if(!owner.isEmpty()&&!raw.isEmpty()) {
+                if(!AlarmStore.phoneSnapshotAllowed(c,owner,snapshot)) { owner=""; snapshot=empty(); }
+                else PhoneFallback.reconcile(c,owner,snapshot);
+            }
         } catch(Exception e) { owner=""; snapshot=empty(); }
     }
     private static JSONObject empty() {
         try { return new JSONObject().put("alarms",new JSONArray()).put("groups",new JSONArray()).put("updatedAt",0); }
         catch(Exception impossible) { throw new IllegalStateException(impossible); }
+    }
+    static synchronized void reconcileCached(Context context) {
+        Context c=context.getApplicationContext(); load(c);
+        if(!owner.isEmpty()&&snapshot.optLong("updatedAt",0)>0) PhoneFallback.reconcile(c,owner,snapshot);
     }
     public static synchronized JSONObject cached(Context context) {
         Context c=context.getApplicationContext(); load(c);
@@ -164,9 +172,7 @@ public final class PhoneSync {
         synchronized(PhoneSync.class) {
             load(c); reachable=node; connectedUntil=SystemClock.elapsedRealtime()+30_000;
             complicationConfirmedUntil=0;
-            if(!node.isEmpty()&&!owner.isEmpty()&&!owner.equals(node)) {
-                owner=""; snapshot=empty(); prefs(c).edit().clear().apply();
-            }
+            // Discovery is not authority to delete the last accepted snapshot.
         }
         broadcast(c);
         if(node.isEmpty()) { lastReadComplete=discoverySucceeded; return; }
@@ -199,17 +205,30 @@ public final class PhoneSync {
             if(next.getLong("revision")!=rev||next.getLong("updatedAt")!=meta.getLong("updatedAt")||
                 !epoch.matches("[0-9a-f-]{36}")||alarms.length()>500||groups.length()>100||active.length()>500) return;
             synchronized(PhoneSync.class) {
+                // A repair reading the identical data must not continuously enqueue itself.
+                if(!node.equals(owner)||!epoch.equals(snapshot.optString("epoch"))||rev!=snapshot.optLong("revision",-1)||
+                        next.optLong("updatedAt")!=snapshot.optLong("updatedAt")) PhoneSyncRepair.schedule(c,false);
+            }
+            synchronized(PhoneSync.class) {
                 if(!node.equals(reachable)) return;
                 if(node.equals(owner)&&epoch.equals(snapshot.optString("epoch"))&&rev<snapshot.optLong("revision",-1)) return;
+                if(node.equals(owner)&&epoch.equals(snapshot.optString("epoch"))&&rev==snapshot.optLong("revision",-1)
+                        &&next.optLong("updatedAt")<snapshot.optLong("updatedAt")) return;
+                // The device-protected scheduler is the epoch authority. Persist its
+                // desired state first so a crash cannot accept an unrecoverable edit.
+                if(!AlarmStore.phoneSnapshotAllowed(c,node,next)) return;
+                PhoneFallback.reconcile(c,node,next);
+                if(!AlarmStore.phoneSnapshotAccepted(c,node,next)) return;
                 if(!prefs(c).edit().putString("owner",node).putString("snapshot",json).commit()) return;
                 owner=node; snapshot=next; next.put("connected",true);
             }
+            boolean fallbackOk=AlarmStore.phoneFallbackProblem(c)==null;
             synchronized(PhoneSync.class) {
                 if(snapshot!=next||reachable.isEmpty()||!reachable.equals(owner)||SystemClock.elapsedRealtime()>=connectedUntil) return;
             }
             // Finish mirror persistence and notification admission while the listener
             // or repair job still owns its background execution lifetime.
-            lastReadComplete=PhoneMirror.onSnapshot(c,next);
+            lastReadComplete=PhoneMirror.onSnapshot(c,next) && fallbackOk;
             synchronized(PhoneSync.class) {
                 if (lastReadComplete && snapshot == next && node.equals(reachable) && node.equals(owner)) {
                     complicationConfirmedUntil = SystemClock.elapsedRealtime() + ComplicationPolicy.FRESH_MS;

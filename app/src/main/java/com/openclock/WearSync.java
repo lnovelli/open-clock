@@ -41,6 +41,7 @@ final class WearSync {
     // Consequently a process death between commit and asynchronous scheduling can
     // lose this advisory wakeup; a later commit or watch refresh repairs it.
     static void beforeCommit(Context c) { }
+    static void afterPhoneFallbackOccurrence(Context c) { }
     static void afterCommit(Context c) {
         try { MainActivity.wearChanged(); } finally { publishSoon(c); }
     }
