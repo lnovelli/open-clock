@@ -66,6 +66,21 @@ public final class IntentApi {
             case "groups.list":
                 fields(r, "op");
                 return out.put("groups", AlarmStore.groups(context));
+            case "alarms.triggerNow": {
+                fields(r, "op", "alarm");
+                JSONObject patch = r.has("alarm") ? object(r, "alarm") : new JSONObject();
+                fields(patch, "label", "sound", "vibrate", "vibrationPattern",
+                        "snoozeEnabled", "snoozeMinutes", "snoozeCount", "groupId");
+                java.time.ZonedDateTime now = java.time.ZonedDateTime.now();
+                JSONObject alarm = new JSONObject().put("hour", now.getHour()).put("minute", now.getMinute())
+                        .put("date", now.toLocalDate().toString()).put("days", new JSONArray())
+                        .put("label", "").put("enabled", true).put("sound", false)
+                        .put("vibrate", true).put("vibrationPattern", "basic").put("snoozeEnabled", true)
+                        .put("snoozeMinutes", 5).put("snoozeCount", 3).put("groupId", JSONObject.NULL);
+                merge(alarm, patch);
+                validateAlarm(context, alarm);
+                return out.put("alarm", AlarmStore.triggerNow(context, alarm));
+            }
             case "alarms.create":
             case "alarms.update": {
                 fields(r, "op", "alarm");

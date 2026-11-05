@@ -18,7 +18,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
-/** Phone occurrences are advisory and deliberately never touch the watch AlarmStore. */
+/** Advisory phone sessions; local dismissals only touch an exactly linked watch fallback. */
 public final class PhoneMirror {
     static final String CHANNEL = "phone_mirror_v1";
     static final int SERVICE_ID = 31901, ALERT_ID = 31902;
@@ -27,7 +27,7 @@ public final class PhoneMirror {
     private static final int MAX_TOKENS = 4096;
     private static final Object LOCK = new Object();
     private static final java.util.Map<String, Long> elapsedDeadlines = new java.util.HashMap<>();
-    private static final Set<String> acknowledgedInProcess = new HashSet<>();
+    private static final Set<String> suppressedInProcess = new HashSet<>();
 
     private static SharedPreferences prefs(Context c) {
         return c.getApplicationContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -95,6 +95,8 @@ public final class PhoneMirror {
                         || proposed.optLong("revision", -1) != current.optLong("revision", -1)
                         || !String.valueOf(proposed.opt("active")).equals(String.valueOf(current.opt("active")))) return false;
                 List<JSONObject> active = validate(proposed);
+                Set<String> dismissed = PhoneSync.mirrorDismissalsInOutbox(c, current);
+                Set<String> mirrorDismissed = AlarmStore.mirrorDismissalKeys(c);
                 JSONArray old = records(c), next = new JSONArray(); long now = System.currentTimeMillis();
                 Set<String> present = new HashSet<>();
                 for (JSONObject a : active) present.add(identity(a));
@@ -119,6 +121,8 @@ public final class PhoneMirror {
                     } else {
                         r.put("expiresAt", Math.min(r.getLong("expiresAt"), end));
                     }
+                    if (mirrorDismissed.contains(identity(a)) ||
+                            dismissed.contains(a.getLong("id") + ":" + a.optString("occurrenceId", ""))) r.put("closed", true);
                 }
                 if (!save(c, next)) return false; // never alert without durable replay protection
                 for (int i = 0; i < next.length(); i++) {
@@ -161,9 +165,12 @@ public final class PhoneMirror {
     }
     private static List<JSONObject> liveLocked(Context c, JSONObject snapshot, JSONArray saved) throws Exception {
         List<JSONObject> live = new ArrayList<>();
+        Set<String> dismissed = AlarmStore.mirrorDismissalKeys(c);
+        Set<String> consumed = PhoneSync.mirrorDismissalsInOutbox(c, snapshot);
         for (JSONObject a : validate(snapshot)) {
             JSONObject r = record(saved, a.getString("token"));
-            if (r == null || r.optBoolean("closed") || acknowledgedInProcess.contains(identity(a))
+            if (r == null || r.optBoolean("closed") || dismissed.contains(identity(a)) ||
+                    consumed.contains(a.optLong("id") + ":" + a.optString("occurrenceId", "")) || suppressedInProcess.contains(identity(a))
                     || r.optLong("id") != a.getLong("id")) continue;
             long end = Math.min(r.getLong("expiresAt"), a.getLong("expiresAt"));
             a.put("expiresAt", end);
@@ -188,9 +195,130 @@ public final class PhoneMirror {
             return Math.max(0, Math.min(limited, deadline - elapsed));
         }
     }
+    // A watch dismissal is a local tombstone, not a phone acknowledgement.
+    // Only a live, validated mirror token can be suppressed.
+    private static JSONObject silenceLocked(Context c, JSONObject identity) throws Exception {
+        long id=identity.getLong("id"); String token=identity.getString("token");
+        JSONArray state = records(c);
+        boolean found=false;
+        for (JSONObject a : liveLocked(c, PhoneSync.cached(c), state)) {
+            if (a.optLong("id") == id && token.equals(a.optString("token"))) { found=true; break; }
+        }
+        if (!found) return null;
+        JSONObject result;
+        try { result=AlarmStore.dismissMirror(c, identity); }
+        catch (Exception failure) {
+            android.util.Log.w("PhoneMirror", "Could not journal mirror dismissal", failure);
+            result=new JSONObject().put("queued",false);
+        }
+        // Suppress even on storage failure, with an explicit warning. A successful
+        // store commit is the authoritative tombstone if this second save fails.
+        suppressedInProcess.add(id + ":" + token);
+        JSONObject r = record(state, token);
+        r.put("closed", true);
+        if(!save(c, state)) android.util.Log.w("PhoneMirror", "Could not save mirror preferences");
+        cancel(c, r);
+        return result;
+    }
+    // A fallback can be dismissed after the cache commit but before onSnapshot
+    // creates its mirror record. Reserve a tombstone before that callback runs.
+    private static boolean silenceLinkedLocked(Context c, long id, String token) throws Exception {
+        JSONArray state = records(c);
+        JSONObject found = null;
+        for (JSONObject a : validate(PhoneSync.cached(c))) {
+            if (a.optLong("id") == id && token.equals(a.optString("token"))) { found = a; break; }
+        }
+        long now = System.currentTimeMillis();
+        if (found == null || found.optLong("expiresAt") <= now || found.optLong("startedAt") > now + 60_000) return false;
+        JSONObject r = record(state, token);
+        if (r != null && r.optLong("id") != id) return false;
+        suppressedInProcess.add(id + ":" + token);
+        if (r == null) {
+            if (state.length() >= MAX_TOKENS) return true; // process-local fail-closed
+            r = new JSONObject().put("id", id).put("token", token).put("expiresAt", found.getLong("expiresAt"));
+            state.put(r);
+        }
+        r.put("closed", true);
+        save(c, state);
+        cancel(c, r);
+        return true;
+    }
+    private static void localChanged(Context c) {
+        try { c.startService(new Intent(c, PhoneMirrorService.class)); } catch (RuntimeException ignored) { }
+        c.sendBroadcast(new Intent("com.openclock.PHONE_MIRROR_CHANGED").setPackage(c.getPackageName()));
+    }
+    /** Hook after an explicit fallback dismissal committed, and after releasing AlarmStore.class.
+     * The argument is the validated active row captured under that lock before finish(). */
+    static void localDismissed(Context context, JSONObject fallback) {
+        if (fallback == null || !fallback.optBoolean("_phoneFallback")) return;
+        JSONObject session = fallback.optJSONObject("_active");
+        if (session == null) return;
+        Context c = context.getApplicationContext(); boolean silenced = false;
+        synchronized (LOCK) {
+            try {
+                synchronized (PhoneSync.class) {
+                    long phoneId = fallback.optLong("_phoneId");
+                    String token = PhoneSync.linkedMirrorToken(c, fallback.optString("_phoneNode"),
+                            fallback.optString("_phoneEpoch"), phoneId, session.optString("occurrenceId"));
+                    if (token != null) silenced = silenceLinkedLocked(c, phoneId, token);
+                }
+            } catch (Exception ignored) { }
+        }
+        if (silenced) localChanged(c);
+    }
+    /** User dismissal of a live mirror: silence locally, then try the phone separately. */
+    static boolean dismiss(Context context, long id, String token) {
+        return dismiss(context, id, token, false);
+    }
+    static boolean dismissFromShake(Context context, long id, String token) {
+        return dismiss(context, id, token, true);
+    }
+    private static boolean dismiss(Context context, long id, String token, boolean requireNoLocal) {
+        if (id <= 0 || token == null) return false;
+        Context c = context.getApplicationContext();
+        PhoneDismissalJob.beforeCommit(c);
+        JSONObject identity, result;
+        synchronized (LOCK) {
+            try {
+                synchronized (PhoneSync.class) {
+                    identity = PhoneSync.mirrorIdentity(c, id, token);
+                    if (identity == null) return false;
+                    if (requireNoLocal) {
+                        // Preserve shake's local-first admission without taking
+                        // the store lock before mirror/sync locks.
+                        synchronized (AlarmStore.class) {
+                            if (AlarmStore.active(c).length() != 0) return false;
+                            JSONObject first = null;
+                            for (JSONObject candidate : liveLocked(c, PhoneSync.cached(c), records(c)))
+                                if (first == null || candidate.optLong("id") < first.optLong("id")) first = candidate;
+                            if (first == null || first.optLong("id") != id
+                                    || !token.equals(first.optString("token"))) return false;
+                            result=silenceLocked(c, identity);
+                        }
+                    } else result=silenceLocked(c, identity);
+                    if (result==null) return false;
+                }
+            } catch (Exception invalid) { return false; }
+        }
+        if (result.optBoolean("fallbackChanged")) {
+            try { AlarmStore.finishMirrorFallbackEffects(c, result); }
+            catch (Exception failure) { android.util.Log.w("PhoneMirror", "Fallback cleanup deferred", failure); }
+            try { AlarmStore.refreshService(c); } catch (RuntimeException ignored) { }
+            WearSync.afterCommit(c);
+            WearSync.afterPhoneFallbackOccurrence(c);
+        }
+        PhoneDismissalJob.schedule(c);
+        if (!result.optBoolean("queued") && !result.optBoolean("duplicate")) {
+            android.util.Log.w("PhoneMirror", "Could not queue phone dismissal");
+            try { AlarmNotifications.warning(c, "Mirror silenced; phone dismissal could not be queued."); }
+            catch (RuntimeException ignored) { }
+        }
+        localChanged(c);
+        return true;
+    }
     static void acknowledged(Context c, long id, String token) {
         synchronized (LOCK) {
-            acknowledgedInProcess.add(id + ":" + token);
+            suppressedInProcess.add(id + ":" + token);
             try {
                 JSONArray state = records(c); JSONObject r = record(state, token);
                 if (r != null && r.optLong("id") == id) {

@@ -21,6 +21,7 @@ import org.json.JSONObject;
 final class WearSync {
     static final String PREFIX="/openclock/v1/", META=PREFIX+"snapshot", CHUNK=PREFIX+"chunk/";
     static final String REQUEST=PREFIX+"request", COMMAND=PREFIX+"command", REPLY=PREFIX+"reply";
+    static final String DISMISS=PREFIX+"dismiss-occurrence", DISMISS_REPLY=PREFIX+"dismiss-occurrence-reply";
     static final String CREATE=PREFIX+"create", CREATE_STATUS=PREFIX+"create-status", CREATE_REPLY=PREFIX+"create-reply";
     static final String MUTATE=PREFIX+"mutate", MUTATE_STATUS=PREFIX+"mutate-status", MUTATE_REPLY=PREFIX+"mutate-reply";
     static final int CHUNK_SIZE=60_000, MAX_CHUNKS=64, MAX_RAW=4_000_000;
@@ -41,7 +42,9 @@ final class WearSync {
     // Consequently a process death between commit and asynchronous scheduling can
     // lose this advisory wakeup; a later commit or watch refresh repairs it.
     static void beforeCommit(Context c) { }
+    static boolean enqueueGenericDismissal(JSONObject state) { return true; }
     static void afterPhoneFallbackOccurrence(Context c) { }
+    static void afterLocalDismissal(Context c,JSONObject dismissed) { }
     static void afterCommit(Context c) {
         try { MainActivity.wearChanged(); } finally { publishSoon(c); }
     }

@@ -118,7 +118,7 @@ final class AlarmNotifications {
             .setContentIntent(PendingIntent.getActivity(c,0,new Intent(c,MainActivity.class),PendingIntent.FLAG_IMMUTABLE))
             .setCategory(Notification.CATEGORY_SERVICE).build();
     }
-    static void warning(Context c,String message) {
+    static synchronized void warning(Context c,String message) {
         try {
             channels(c);
             Notification n=new Notification.Builder(c,STATUS_CHANNEL).setSmallIcon(R.drawable.ic_alarm)
@@ -126,5 +126,20 @@ final class AlarmNotifications {
                 .setAutoCancel(true).setContentIntent(PendingIntent.getActivity(c,0,new Intent(c,MainActivity.class),PendingIntent.FLAG_IMMUTABLE)).build();
             c.getSystemService(NotificationManager.class).notify("problem",20,n);
         } catch(SecurityException ignored) { /* MainActivity also exposes accessProblem(). */ }
+    }
+    /** Clear only our fallback warning, never a different scheduling or ringing warning. */
+    static synchronized void clearPhoneFallbackWarning(Context c,boolean journalOnly) {
+        try {
+            NotificationManager nm=c.getSystemService(NotificationManager.class);
+            for(android.service.notification.StatusBarNotification shown:nm.getActiveNotifications()) {
+                if(!"problem".equals(shown.getTag())||shown.getId()!=20) continue;
+                CharSequence text=shown.getNotification().extras.getCharSequence(Notification.EXTRA_TEXT);
+                if(text==null) continue;
+                String message=text.toString();
+                if(message.startsWith("Phone fallback: ")||
+                        (!journalOnly&&message.startsWith("Phone fallback not synchronized: ")))
+                    nm.cancel("problem",20);
+            }
+        } catch(RuntimeException ignored) { /* The warning is advisory; do not block alarm recovery. */ }
     }
 }

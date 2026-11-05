@@ -34,7 +34,8 @@ public final class PhoneSync {
     private static final String PREFIX="/openclock/v1/", META=PREFIX+"snapshot", CHUNK=PREFIX+"chunk/",
         REQUEST=PREFIX+"request", COMMAND=PREFIX+"command", REPLY=PREFIX+"reply",
         CREATE=PREFIX+"create", CREATE_STATUS=PREFIX+"create-status", CREATE_REPLY=PREFIX+"create-reply",
-        MUTATE=PREFIX+"mutate", MUTATE_STATUS=PREFIX+"mutate-status", MUTATE_REPLY=PREFIX+"mutate-reply";
+        MUTATE=PREFIX+"mutate", MUTATE_STATUS=PREFIX+"mutate-status", MUTATE_REPLY=PREFIX+"mutate-reply",
+        DISMISS_REPLY=PREFIX+"dismiss-occurrence-reply";
     private static final int CHUNK_SIZE=60_000, MAX_CHUNKS=64, MAX_RAW=4_000_000;
     private static final Handler MAIN=new Handler(Looper.getMainLooper());
     private static final java.util.concurrent.ExecutorService FETCH=java.util.concurrent.Executors.newSingleThreadExecutor();
@@ -48,8 +49,10 @@ public final class PhoneSync {
     private static boolean complicationBarrierFailed;
     private static Pending pending;
     private static final class Pending {
-        final String id,node; final Callback callback;
-        Pending(String id,String node,Callback callback) { this.id=id; this.node=node; this.callback=callback; }
+        final String id,node,epoch,token; final long alarm; final boolean dismiss; final Callback callback;
+        Pending(String id,String node,String epoch,long alarm,String token,boolean dismiss,Callback callback) {
+            this.id=id; this.node=node; this.epoch=epoch; this.alarm=alarm; this.token=token; this.dismiss=dismiss; this.callback=callback;
+        }
     }
     private static SharedPreferences prefs(Context c) { return c.getApplicationContext().getSharedPreferences("phone-snapshot-v1",Context.MODE_PRIVATE); }
     private static synchronized void load(Context c) {
@@ -159,7 +162,7 @@ public final class PhoneSync {
             } finally { fetching.set(false); if(dirty.getAndSet(false)||wantsRequest.get()) startFetch(c,false); }
         });
     }
-    private static String onePhone(Context c) throws Exception {
+    static String onePhone(Context c) throws Exception {
         CapabilityInfo info=Tasks.await(Wearable.getCapabilityClient(c).getCapability("openclock_phone_v1",CapabilityClient.FILTER_REACHABLE),5,TimeUnit.SECONDS);
         if(info.getNodes().size()!=1) return "";
         Node node=info.getNodes().iterator().next(); return node.getId();
@@ -229,6 +232,7 @@ public final class PhoneSync {
             // Finish mirror persistence and notification admission while the listener
             // or repair job still owns its background execution lifetime.
             lastReadComplete=PhoneMirror.onSnapshot(c,next) && fallbackOk;
+            PhoneDismissalJob.schedule(c);
             synchronized(PhoneSync.class) {
                 if (lastReadComplete && snapshot == next && node.equals(reachable) && node.equals(owner)) {
                     complicationConfirmedUntil = SystemClock.elapsedRealtime() + ComplicationPolicy.FRESH_MS;
@@ -279,17 +283,154 @@ public final class PhoneSync {
                     }
                     if(!cp.edit().putString("barrier",barrier.toString()).commit()) complicationBarrierFailed=true;
                 } catch(Exception failure) { complicationBarrierFailed=true; }
-                pending=new Pending(id,node,callback);
+                pending=new Pending(id,node,epoch,alarm,token,"finish".equals(op)&&!value,callback);
             }
         } catch(Exception e) { MAIN.post(()->callback.onResult(false,"Phone unavailable or snapshot not ready; refresh")); return; }
         broadcast(c);
         MAIN.postDelayed(()->finish(c,id,false,"Result unknown; refresh on watch"),25_000);
+        sendCommand(c,id,node,epoch,op,alarm,token,value,rev);
+        if("finish".equals(op)&&!value) {
+            MAIN.postDelayed(()->sendCommand(c,id,node,epoch,op,alarm,token,value,rev),7_000);
+            MAIN.postDelayed(()->sendCommand(c,id,node,epoch,op,alarm,token,value,rev),14_000);
+        }
+    }
+    private static boolean canonicalUuid(String value) {
+        try { return value != null && UUID.fromString(value).toString().equals(value); }
+        catch (RuntimeException invalid) { return false; }
+    }
+    // Called only outside the store lock. A token alone is not a fallback link:
+    // node, epoch, phone alarm and occurrence must all agree with the cache.
+    static synchronized String linkedMirrorToken(Context context, String node, String epoch,
+                                                  long alarm, String occurrence) {
+        load(context.getApplicationContext());
+        if (node == null || node.isEmpty() || !node.equals(owner) || !canonicalUuid(epoch)
+                || !epoch.equals(snapshot.optString("epoch")) || alarm <= 0 || !canonicalUuid(occurrence)) return null;
+        JSONArray active = snapshot.optJSONArray("active");
+        if (active == null) return null;
+        String result = null;
+        for (int i = 0; i < active.length(); i++) {
+            JSONObject row = active.optJSONObject(i);
+            if (row == null || row.optLong("id") != alarm) continue;
+            String token = row.optString("token", "");
+            if (result != null || !canonicalUuid(token) || !occurrence.equals(row.optString("occurrenceId"))
+                    || row.optLong("expiresAt") <= System.currentTimeMillis()) return null;
+            result = token;
+        }
+        return result;
+    }
+    // A mirror first discovered after a local fallback dismissal must not ring
+    // the same occurrence while its durable phone request is still in the outbox.
+    static synchronized java.util.Set<String> mirrorDismissalsInOutbox(Context context, JSONObject expected) {
+        java.util.Set<String> result = new java.util.HashSet<>();
+        Context c = context.getApplicationContext();
+        load(c);
+        if (snapshot != expected || owner.isEmpty()) return result;
+        String epoch = snapshot.optString("epoch", "");
+        if (!canonicalUuid(epoch)) return result;
+        try {
+            result.addAll(AlarmStore.consumedPhoneOccurrences(c, owner, epoch));
+            JSONArray entries = AlarmStore.pendingPhoneDismissals(c);
+            for (int i = 0; i < entries.length(); i++) {
+                JSONObject item = entries.optJSONObject(i);
+                if (item == null) continue;
+                long id = item.optLong("id");
+                String occurrence = item.optString("occurrenceId", "");
+                if (id > 0 && canonicalUuid(occurrence) && owner.equals(item.optString("node"))
+                        && epoch.equals(item.optString("epoch")) && item.optLong("expiresAt") > System.currentTimeMillis())
+                    result.add(id + ":" + occurrence);
+            }
+            entries = AlarmStore.genericDismissals(c);
+            for (int i = 0; i < entries.length(); i++) {
+                JSONObject item=entries.optJSONObject(i);
+                if(item==null) continue;
+                long id=item.optLong("fallbackId");
+                String occurrence=item.optString("fallbackOccurrence", "");
+                if(id>0&&canonicalUuid(occurrence)&&owner.equals(item.optString("fallbackNode"))&&
+                        epoch.equals(item.optString("fallbackEpoch"))&&item.optLong("expiresAt")>System.currentTimeMillis())
+                    result.add(id+":"+occurrence);
+            }
+        } catch (RuntimeException unavailable) { /* no guessed match */ }
+        return result;
+    }
+    static synchronized JSONObject mirrorIdentity(Context context, long id, String token) {
+        load(context.getApplicationContext());
+        if (owner.isEmpty() || !canonicalUuid(snapshot.optString("epoch")) || !canonicalUuid(token)) return null;
+        JSONArray active = snapshot.optJSONArray("active");
+        if (active == null) return null;
+        JSONObject found = null;
+        for (int i = 0; i < active.length(); i++) {
+            JSONObject row = active.optJSONObject(i);
+            if (row == null || row.optLong("id") != id) continue;
+            if (found != null || !token.equals(row.optString("token"))
+                    || row.optLong("expiresAt") <= System.currentTimeMillis()) return null;
+            found = row;
+        }
+        if (found == null) return null;
+        try { return new JSONObject().put("node", owner).put("epoch", snapshot.getString("epoch"))
+                .put("id", id).put("token", token).put("occurrenceId", found.optString("occurrenceId", ""))
+                .put("expiresAt", found.getLong("expiresAt")); }
+        catch (Exception invalid) { return null; }
+    }
+    private static boolean sameMirrorIdentity(Context c, JSONObject identity) {
+        if (identity == null) return false;
+        JSONObject current = mirrorIdentity(c, identity.optLong("id"), identity.optString("token"));
+        return current != null && identity.optString("node").equals(current.optString("node"))
+                && identity.optString("epoch").equals(current.optString("epoch"))
+                && identity.optString("occurrenceId").equals(current.optString("occurrenceId"));
+    }
+    static synchronized void commandMirrorDismiss(Context c, JSONObject identity) {
+        if (!sameMirrorIdentity(c, identity)) return;
+        try {
+            JSONObject cmd = new JSONObject().put("op", "finish").put("id", identity.getLong("id"))
+                    .put("token", identity.getString("token")).put("snooze", false);
+            command(c, cmd, (ok, message) -> requestSnapshot(c));
+        } catch (Exception invalid) { requestSnapshot(c); }
+    }
+    private static boolean noNewerSession(JSONObject snap,long alarm,String token) {
+        JSONArray active=snap.optJSONArray("active");
+        if(active==null) return false;
+        for(int i=0;i<active.length();i++) {
+            JSONObject row=active.optJSONObject(i);
+            if(row!=null&&row.optLong("id")==alarm&&!token.equals(row.optString("token"))) return false;
+        }
+        return true;
+    }
+    private static boolean hasActiveSession(JSONObject snap,long alarm,String token) {
+        JSONArray active=snap.optJSONArray("active");
+        if(active==null) return false;
+        for(int i=0;i<active.length();i++) {
+            JSONObject row=active.optJSONObject(i);
+            if(row!=null&&row.optLong("id")==alarm&&token.equals(row.optString("token"))&&
+                    row.optLong("expiresAt")>System.currentTimeMillis()) return true;
+        }
+        return false;
+    }
+    static synchronized boolean dismissalOwner(Context c,String node,String epoch,long alarm,String occurrence) {
+        load(c);
+        if(!node.equals(owner)||!epoch.equals(snapshot.optString("epoch"))) return false;
+        JSONArray active=snapshot.optJSONArray("active");
+        if(active==null) return false;
+        for(int i=0;i<active.length();i++) {
+            JSONObject row=active.optJSONObject(i);
+            if(row!=null&&row.optLong("id")==alarm) {
+                String current=row.optString("occurrenceId","");
+                if(!occurrence.equals(current)) return false;
+            }
+        }
+        return true;
+    }
+    private static void sendCommand(Context c,String id,String node,String epoch,String op,long alarm,String token,boolean value,long rev) {
         SEND.execute(()->{
             try {
-                if(!node.equals(onePhone(c))) { finish(c,id,false,"Phone unavailable; refresh on watch"); return; }
+                if(!node.equals(onePhone(c))) {
+                    synchronized(PhoneSync.class) { if(pending!=null&&id.equals(pending.id)&&pending.dismiss) { startFetch(c,true); return; } }
+                    finish(c,id,false,"Phone unavailable; refresh on watch"); return;
+                }
                 long issued;
                 synchronized(PhoneSync.class) {
-                    if(pending==null||!id.equals(pending.id)) return;
+                    if(pending==null||!id.equals(pending.id)||!node.equals(owner)||!node.equals(reachable)||
+                            !epoch.equals(snapshot.optString("epoch"))||SystemClock.elapsedRealtime()>=connectedUntil||
+                            (pending.dismiss&&!hasActiveSession(snapshot,alarm,token))) return;
                     issued=System.currentTimeMillis();
                     try {
                         SharedPreferences cp=commandPrefs(c); JSONObject b=new JSONObject(cp.getString("barrier","{}"));
@@ -304,9 +445,15 @@ public final class PhoneSync {
                 if("setEnabled".equals(op)) cmd.put("enabled",value).put("revision",rev);
                 else cmd.put("token",token).put("snooze",value);
                 Wearable.getMessageClient(c).sendMessage(node,COMMAND,cmd.toString().getBytes(StandardCharsets.UTF_8))
-                    .addOnFailureListener(e->finish(c,id,false,"Result unknown; refresh on watch"));
-            } catch(Exception e) { finish(c,id,false,"Result unknown; refresh on watch"); }
+                    .addOnFailureListener(e->commandFailure(c,id));
+            } catch(Exception e) { commandFailure(c,id); }
         });
+    }
+    private static void commandFailure(Context c,String id) {
+        synchronized(PhoneSync.class) {
+            if(pending!=null&&id.equals(pending.id)&&pending.dismiss) { startFetch(c,true); return; }
+        }
+        finish(c,id,false,"Result unknown; refresh on watch");
     }
     private static CreateCallback createCallback;
     private static String createActive="";
@@ -650,6 +797,7 @@ public final class PhoneSync {
         } catch(Exception ignored) { }
     }
     static void reply(Context context,String node,String path,byte[] body) {
+        if(GenericDismissProtocol.REPLY.equals(path)) { PhoneDismissalJob.reply(context.getApplicationContext(),node,body); return; }
         if(CREATE_REPLY.equals(path)) { createReply(context.getApplicationContext(),node,body); return; }
         if(MUTATE_REPLY.equals(path)) { mutationReply(context.getApplicationContext(),node,body); return; }
         if(!REPLY.equals(path)||body==null||body.length>1024) return;
@@ -658,10 +806,13 @@ public final class PhoneSync {
             String id=result.getString("requestId"); boolean ok=result.getBoolean("ok");
             synchronized(PhoneSync.class) {
                 if(pending==null||!pending.node.equals(node)||!pending.id.equals(id)) return;
-                if(!node.equals(owner)||!node.equals(reachable)) ok=false;
+                if(!pending.epoch.equals(result.optString("epoch"))||!node.equals(owner)||!node.equals(reachable)||!pending.epoch.equals(snapshot.optString("epoch"))||
+                        SystemClock.elapsedRealtime()>=connectedUntil||
+                        (pending.dismiss&&!noNewerSession(snapshot,pending.alarm,pending.token))) ok=false;
+                if(!ok&&pending.dismiss) { startFetch(context.getApplicationContext(),true); return; }
+                long committedRevision = result.opt("revision") instanceof Number ? result.optLong("revision",-1) : -1;
+                finish(context.getApplicationContext(),id,ok,ok?"Phone alarm updated":"Phone change not confirmed; refresh on watch",committedRevision);
             }
-            long committedRevision = result.opt("revision") instanceof Number ? result.optLong("revision",-1) : -1;
-            finish(context.getApplicationContext(),id,ok,ok?"Phone alarm updated":"Phone change not confirmed; refresh on watch",committedRevision);
         } catch(Exception ignored) { }
     }
     private static void finish(Context c,String id,boolean ok,String message) {

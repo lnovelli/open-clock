@@ -126,12 +126,13 @@ public final class AlarmActivity extends Activity {
         boolean muted = alarm.optJSONObject("_active").optBoolean("soundMuted");
         String label = muted ? (available ? "Sound muted" : "Sound muted\nSnooze unavailable")
                 : available ? "" : "Snooze unavailable";
-        if (alarm.optBoolean("_phoneFallback")) label = "Watch copy only" + (label.isEmpty() ? "" : "\n" + label);
+        if (alarm.optBoolean("_phoneFallback")) label = "Phone may still ring" + (label.isEmpty() ? "" : "\n" + label);
         RingingScreen.setStatus(status, label);
     }
 
     private void complete(boolean snooze) {
         try {
+            JSONObject dismissed = null;
             // Store operations are synchronized on this same lock. Keep validation,
             // mutation and notification cancellation together so a stale screen cannot
             // cancel a replacement occurrence's notification.
@@ -140,6 +141,7 @@ public final class AlarmActivity extends Activity {
                 if (alarm == null) { finish(); return; }
                 if (snooze && !AlarmStore.canSnooze(alarm)) { updateState(alarm); return; }
                 AlarmStore.finish(this, id, token, snooze);
+                if (!snooze) dismissed = alarm;
                 try {
                     getSystemService(NotificationManager.class).cancel("alarm:" + id, 11);
                 } catch (RuntimeException e) {
@@ -147,6 +149,7 @@ public final class AlarmActivity extends Activity {
                     AlarmNotifications.warning(this, "Could not clear the alarm notification");
                 }
             }
+            PhoneMirror.localDismissed(this, dismissed);
             AlarmStore.refreshService(this);
             finish();
         } catch (Exception e) {

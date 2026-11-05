@@ -183,29 +183,34 @@ final class WatchShakeBridge implements SensorEventListener {
             return;
         }
         try {
-            // Check global priority and occurrence immediately at action admission. The store
-            // lock prevents a local fire/mutation from interleaving this decision and action.
-            synchronized (AlarmStore.class) {
-                Target now = select();
-                if (!detected.same(now)) { reconcile(); return; }
-                if (detected.local) {
-                    if (AlarmStore.active(app, detected.id, detected.token) == null) return;
+            if (detected.local) {
+                JSONObject dismissed = null;
+                synchronized (AlarmStore.class) {
+                    // Select local priority without consulting mirror/sync while
+                    // holding the store lock (sync itself can acquire this lock).
+                    JSONArray local = AlarmStore.active(app);
+                    Target best = null;
+                    for (int i = 0; i < local.length(); i++) {
+                        JSONObject a = local.optJSONObject(i), s = a == null ? null : a.optJSONObject("_active");
+                        if (s == null) continue;
+                        Target candidate = new Target(true, a.optLong("id"), s.optString("token"));
+                        if (candidate.id > 0 && !candidate.token.isEmpty() && (best == null || candidate.id < best.id)) best = candidate;
+                    }
+                    if (!localService || !detected.same(best)) return;
+                    dismissed = AlarmStore.active(app, detected.id, detected.token);
+                    if (dismissed == null) return;
                     AlarmStore.finish(app, detected.id, detected.token, false);
                     try { app.getSystemService(NotificationManager.class).cancel("alarm:" + detected.id, 11); }
                     catch (RuntimeException ignored) { }
-                    AlarmStore.refreshService(app);
-                } else {
-                    if (PhoneMirror.current(app, detected.id, detected.token) == null) return;
-                    JSONObject cmd = new JSONObject().put("op", "finish").put("id", detected.id)
-                            .put("token", detected.token).put("snooze", false);
-                    PhoneSync.command(app, cmd, (ok, message) -> {
-                        if (ok) PhoneMirror.acknowledged(app, detected.id, detected.token);
-                        else PhoneSync.requestSnapshot(app); // timeout is not a dismissal
-                    });
                 }
+                PhoneMirror.localDismissed(app, dismissed);
+                AlarmStore.refreshService(app);
+            } else if (mirrorService) {
+                // Admission atomically checks local priority using mirror -> sync -> store.
+                PhoneMirror.dismissFromShake(app, detected.id, detected.token);
             }
         } catch (Exception ignored) { /* leave normal controls and ringing intact */ }
-        reconcile();
+        finally { reconcile(); }
     }
 
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }

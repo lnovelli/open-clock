@@ -100,6 +100,13 @@ public final class PhoneMirrorActivity extends Activity {
         JSONObject current = PhoneMirror.current(this, id, token);
         if (current == null) { PhoneSync.requestSnapshot(this); finish(); return; }
         if (wantSnooze && !current.optBoolean("canSnooze")) { update(current); return; }
+        if (!wantSnooze) {
+            if (PhoneMirror.dismiss(this, id, token)) {
+                android.widget.Toast.makeText(this, "Mirror silenced; phone dismissal not confirmed", android.widget.Toast.LENGTH_LONG).show();
+                finish();
+            } else { PhoneSync.requestSnapshot(this); finish(); }
+            return;
+        }
         final long sentId = id; final String sentToken = token, sentKey = key;
         final android.content.Context app = getApplicationContext();
         Attempt attempt = new Attempt(); attempts.put(sentKey, attempt); update(current);

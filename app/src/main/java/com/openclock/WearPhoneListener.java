@@ -18,13 +18,55 @@ public final class WearPhoneListener extends WearableListenerService {
         final String path=e.getPath(), node=e.getSourceNodeId();
         final byte[] body=e.getData();
         if(node==null||node.isEmpty()||node.length()>256||body==null||body.length>(WearSync.MUTATE.equals(path)?8192:1024)||
-            !(WearSync.REQUEST.equals(path)||WearSync.COMMAND.equals(path)||WearSync.CREATE.equals(path)||WearSync.CREATE_STATUS.equals(path)||WearSync.MUTATE.equals(path)||WearSync.MUTATE_STATUS.equals(path))) return;
+            !(WearSync.REQUEST.equals(path)||WearSync.COMMAND.equals(path)||WearSync.DISMISS.equals(path)||GenericDismissProtocol.REQUEST.equals(path)||WearSync.CREATE.equals(path)||WearSync.CREATE_STATUS.equals(path)||WearSync.MUTATE.equals(path)||WearSync.MUTATE_STATUS.equals(path))) return;
         // WearableListenerService dispatches on a background thread. Finish the
         // bounded request before returning so its service binding protects it.
         handle(node,path,body);
     }
     private static long integer(JSONObject obj,String key) throws Exception {
         return new java.math.BigDecimal(obj.get(key).toString()).longValueExact();
+    }
+    private void handleDismissAll(String node,byte[] body) throws Exception {
+        GenericDismissProtocol request=GenericDismissProtocol.parse(body,false);
+        long now=System.currentTimeMillis();
+        if(request.created>now+5_000||request.expires<=now) return;
+        boolean ok=false;
+        try { ok=AlarmStore.wearDismissAll(this,node,request.id,request.created,request.expires); }
+        catch(Exception failure) { android.util.Log.w("OpenClock","Dismiss-all failed",failure); }
+        if(ok) {
+            // A replay may be the first callback after process death. Reconcile
+            // non-destructively without touching a newer active session.
+            try { AlarmStore.reconcileDismissedNotifications(this); }
+            catch(Exception failure) { android.util.Log.w("OpenClock","Dismiss-all notification repair failed",failure); }
+            try { AlarmStore.refreshService(this); } catch(RuntimeException ignored) { }
+            WearSync.requestFromListener(this);
+        }
+        try {
+            Tasks.await(Wearable.getMessageClient(this).sendMessage(node,GenericDismissProtocol.REPLY,
+                GenericDismissProtocol.encode(request.id,request.created,request.expires,ok)),5,TimeUnit.SECONDS);
+        } catch(Exception ignored) { }
+    }
+    private void handleDismiss(String node,byte[] body) throws Exception {
+        JSONObject cmd=new JSONObject(new String(body,StandardCharsets.UTF_8));
+        String uuid="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+        if(cmd.length()!=6 || !(cmd.opt("id") instanceof Number) ||
+                !(cmd.opt("issuedAt") instanceof Number) || !(cmd.opt("expiresAt") instanceof Number) ||
+                !(cmd.opt("requestId") instanceof String) || !(cmd.opt("epoch") instanceof String) ||
+                !(cmd.opt("occurrenceId") instanceof String)) return;
+        String req=cmd.getString("requestId"), epoch=cmd.getString("epoch"), occurrence=cmd.getString("occurrenceId");
+        long id=integer(cmd,"id"), issued=integer(cmd,"issuedAt"), expires=integer(cmd,"expiresAt"), now=System.currentTimeMillis();
+        if(!req.matches(uuid)||!epoch.matches(uuid)||!occurrence.matches(uuid)||!WearSync.epoch(this).equals(epoch)||
+                id<1||issued>now+5_000||issued<now-15_000||expires<=now||expires>now+10*60_000L+5_000) return;
+        boolean ok=false;
+        try { ok=AlarmStore.wearDismissOccurrence(this,id,occurrence,expires); }
+        catch(Exception ignored) { /* May have committed: a negative response is not proof. */ }
+        if(ok) WearSync.publishSoon(this);
+        JSONObject reply=new JSONObject().put("requestId",req).put("epoch",epoch).put("id",id)
+                .put("occurrenceId",occurrence).put("expiresAt",expires).put("ok",ok);
+        try {
+            Tasks.await(Wearable.getMessageClient(this).sendMessage(node,WearSync.DISMISS_REPLY,
+                    reply.toString().getBytes(StandardCharsets.UTF_8)),5,TimeUnit.SECONDS);
+        } catch(Exception ignored) { /* The watch retries the same occurrence if needed. */ }
     }
     private void handleCreate(String node,String path,byte[] body) throws Exception {
         java.io.DataInputStream in=new java.io.DataInputStream(new java.io.ByteArrayInputStream(body));
@@ -103,6 +145,8 @@ public final class WearPhoneListener extends WearableListenerService {
             boolean found=false; for(Node n:info.getNodes()) if(node.equals(n.getId())) found=true;
             if(!found) return;
             if(WearSync.REQUEST.equals(path)) { WearSync.requestFromListener(this); return; }
+            if(GenericDismissProtocol.REQUEST.equals(path)) { handleDismissAll(node,body); return; }
+            if(WearSync.DISMISS.equals(path)) { handleDismiss(node,body); return; }
             if(WearSync.CREATE.equals(path)||WearSync.CREATE_STATUS.equals(path)) { handleCreate(node,path,body); return; }
             if(WearSync.MUTATE.equals(path)||WearSync.MUTATE_STATUS.equals(path)) { handleMutation(node,path,body); return; }
             JSONObject cmd=new JSONObject(new String(body,StandardCharsets.UTF_8));
@@ -129,7 +173,8 @@ public final class WearPhoneListener extends WearableListenerService {
                 try { committedRevision=AlarmStore.wearSnapshot(this).getLong("revision"); } catch(Exception ignored) { }
             } catch(Exception ignored) { }
             if(ok) WearSync.publishSoon(this);
-            JSONObject reply=new JSONObject().put("requestId",req).put("ok",ok).put("message",result);
+            JSONObject reply=new JSONObject().put("requestId",req).put("epoch",cmd.optString("epoch"))
+                    .put("ok",ok).put("message",result);
             if(ok && committedRevision>=0) reply.put("revision",committedRevision);
             Wearable.getMessageClient(this).sendMessage(node,WearSync.REPLY,reply.toString().getBytes(StandardCharsets.UTF_8));
         } catch(Exception ignored) { }

@@ -25,8 +25,11 @@ public final class WearWatchListener extends WearableListenerService {
     @Override public void onCapabilityChanged(CapabilityInfo info) {
         if ("openclock_phone_v1".equals(info.getName())) {
             PhoneSync.capabilityChanged(this);
+            PhoneDismissalJob.expedite(this);
             PhoneSyncRepair.schedule(this,true);
             PhoneSync.fromListener(this,true);
+            // A fresh snapshot may make a previously ineligible target valid.
+            PhoneDismissalJob.expedite(this);
             ComplicationUpdateJob.changed(this,false);
         }
     }
