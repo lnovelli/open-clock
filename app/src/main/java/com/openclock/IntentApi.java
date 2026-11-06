@@ -89,8 +89,10 @@ public final class IntentApi {
                         "sound", "vibrate", "vibrationPattern", "snoozeEnabled", "snoozeMinutes", "snoozeCount", "groupId");
                 boolean update = op.equals("alarms.update");
                 JSONObject alarm;
+                JSONObject previous = null;
                 if (update) {
-                    alarm = copy(find(AlarmStore.alarms(context), integer(patch, "id", 1, Long.MAX_VALUE), "alarm"));
+                    previous = find(AlarmStore.alarms(context), integer(patch, "id", 1, Long.MAX_VALUE), "alarm");
+                    alarm = copy(previous);
                 } else {
                     if (patch.has("id")) throw bad("New alarms must omit id");
                     alarm = new JSONObject().put("date", JSONObject.NULL).put("days", new JSONArray())
@@ -100,7 +102,10 @@ public final class IntentApi {
                 }
                 merge(alarm, patch);
                 validateAlarm(context, alarm);
-                return out.put("alarm", AlarmStore.saveAlarm(context, alarm));
+                JSONObject saved = AlarmStore.saveAlarm(context, alarm);
+                out.put("alarm", saved);
+                ExternalAlarmConfirmation.afterSave(context, previous, saved);
+                return out;
             }
             case "alarms.delete": {
                 fields(r, "op", "id");
