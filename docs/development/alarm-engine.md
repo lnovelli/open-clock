@@ -1,0 +1,28 @@
+# Alarm engine: invariants and test strategy
+
+[BACKEND.md](../../BACKEND.md) describes the current implementation in detail; read it and the current `AlarmStore`, `AlarmTimes`, `AlarmReceiver`, `RestoreReceiver`, `RingingService` and both manifests before editing. The same engine is compiled for phone and watch. Phone and watch have distinct storage, access and OS registrations.
+
+## Schedule and commit
+
+- Keep explicit one-time dates, date-less one-shots and weekly weekdays distinct. Android `AlarmClock.EXTRA_DAYS` is recurring, not an exact-date representation; this app uses its own scheduler. Persist the resolved concrete date for a date-less one-shot. Explicit dated times in DST gaps are rejected; rolling/weekly schedules skip gaps, and an overlap uses the first still-future offset. Preserve the consumed local date so a weekly occurrence cannot ring twice during fall-back. Re-evaluate time/zone changes without relabeling already scheduled occurrences.
+- Gate new or changed enabled schedules on the actual exact-alarm and notification/channel access; do not silently substitute inexact scheduling or claim success when access is missing. Metadata-only edits must preserve private occurrence, active, snooze, generation and retry fields; intentional schedule edits reset occurrence state. A pending snooze or enabled flag does not prove a registration exists.
+- Distinct immutable PendingIntent identity includes alarm ID and generation in the URI, with receiver-required values also in extras; extras alone are not identity. Reload durable state and validate generation/session on fire, snooze and dismiss. Register a replacement before durable commit and retire the old generation only after commit; cancel tentative registrations on failure. Reconcile one record at a time with quota headroom and reuse unchanged future/due generations. Never churn a due delivery merely because an Activity or process starts.
+- Recovery is armed before committing pending or active state and must cover both the prior and proposed state. Reconcile boot/locked boot, replacement, time/zone changes and permission grants while preserving due triggers and the late-delivery policy. Use boot identity plus elapsed time to distinguish stale previous-boot sessions from a new Direct Boot session; first unlock must not dismiss the latter. If a weekly next registration fails while the current alarm rings, preserve its consumed date and durable retry; retry without requiring the UI or phone. The shared recovery alarm consumes quota and may affect the next-alarm indicator and power; it remains OS-mediated best effort. A crash between registration and commit can leave an orphan platform registration: token validation prevents a false ring but quota can still be consumed.
+
+## Presentation and interaction
+
+Follow per-alarm sound/vibration, alarm audio/vibration usage, channel and DND policy; never silently change global DND or volume. Full-screen intent, foreground service, notification, lock-screen and watch wake behavior are independently policy-dependent. Preserve the bounded ringing lifecycle and focus retry; notification fallback does not guarantee continuous audio. The Volume down shortcut is foreground-Activity/key-focus scoped: validate the anchor token, mute all currently active sound owners without dismissing or altering vibration or future occurrences, and recheck persisted mute when async audio starts. Snooze adjustment applies only to the selected occurrence; enforce bounds and token in the store, not only UI.
+
+For user confirmation use the committed `nextTriggerAt`, not reconstructed requested time. The shared `AlarmConfirmation` uses rounded-up relative minutes for under 24 hours and local calendar text otherwise. Show a warning instead of a set claim when access, a future trigger or error-free state is unavailable. Keep phone UI, group aggregation, Wear snapshot confirmation and Binder toast paths separate; do not add an unconditional store toast. Presentation failure must not change a committed mutation.
+
+## Focused regression matrix
+
+Use production code with disposable platform/storage/clock fakes outside the repository when needed; no host fixture should be described as a real Android test. Cover:
+
+1. Explicit and rolling dates, leap day, weekly next occurrence across spring gaps, fall overlaps, time-zone changes and the consumed-date barrier; permission denial/regrant and no inexact fallback.
+2. Unique PendingIntent identities and stale deliveries; injected failure/death before and after registration, disk commit, obsolete cancellation, fire commit and service start; unchanged due generations and quota exhaustion. Check original-state protection and recovery wakeup, including failed persistence and retry backoff.
+3. Metadata edits during active and snoozed sessions, snooze/refire, expiry, previous boot vs locked boot/unlock, failed next-week registration and successful retry, disabling/deleting retry state, and corruption fail-closed behavior.
+4. Actual formatter boundary cases (minute rounding, 24-hour boundary, DST and unavailable trigger); multi-owner mute, held key/focus loss and delayed player/focus callbacks; denied service/audio focus and channel permissions.
+5. The separate phone fallback staged-registration, tombstone and owner scenarios in [wear-sync.md](wear-sync.md).
+
+Build both affected APKs and inspect applicable manifests/resources. Host `AtomicFile`, fsync, AlarmManager and service fakes cannot establish device durability, sound, vibration, exact delivery, lock-screen presentation, reboot or OEM behavior. Perform physical tests only when explicitly authorized; disclose what remains unverified and recommend a trusted backup for important alarms.
