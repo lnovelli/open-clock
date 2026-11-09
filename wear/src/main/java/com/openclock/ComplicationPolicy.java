@@ -3,11 +3,9 @@ package com.openclock;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** Pure selection and quota rules, shared with the host probes. */
+/** Pure selection and timeline rules, shared with the host probes. */
 final class ComplicationPolicy {
     static final long FRESH_MS = 5 * 60_000L;
-    static final long INTERVAL = 5 * 60_000L;
-    static final long CAPACITY = 2 * INTERVAL;
     static final int DISPLAY_LIMIT = 3;
 
     static final class Selection {
@@ -118,11 +116,5 @@ final class ComplicationPolicy {
         return after > 0 && snapshot.optLong("updatedAt", 0) > after;
     }
 
-    static long refill(long credits, long elapsed) {
-        credits = Math.max(0, Math.min(CAPACITY, credits));
-        if (elapsed <= 0) return credits;
-        return credits + Math.min(CAPACITY - credits, elapsed);
-    }
-    static long delay(long credits) { return Math.max(0, INTERVAL - Math.max(0, Math.min(CAPACITY, credits))); }
     private ComplicationPolicy() { }
 }
