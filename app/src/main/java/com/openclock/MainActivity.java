@@ -64,6 +64,9 @@ public class MainActivity extends Activity {
     private ScrollView homeRestoreTarget;
     private JSONObject draft;
     private String alarmBaseline;
+    private static final String VIEW_ALARM_ACTION = "com.openclock.action.VIEW_ALARM";
+    private long pendingAlarmLink = -1;
+    private AlertDialog alarmLinkPrompt;
     private NumberPicker hourPicker, minutePicker;
     private EditText labelInput;
     private Switch enabledSwitch, soundSwitch, vibrationSwitch, snoozeSwitch;
@@ -99,6 +102,7 @@ public class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        pendingAlarmLink = state == null ? alarmLinkId(getIntent()) : state.getLong("pendingAlarmLink", -1);
         initColors();
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
@@ -168,10 +172,67 @@ public class MainActivity extends Activity {
         // Never discard an editor when returning from a system permission page.
         if ("home".equals(screen)) showHome();
         else if ("permissions".equals(screen)) showPermissions();
+        openPendingAlarmLink();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        long id = alarmLinkId(intent);
+        if (id <= 0) return;
+        if (alarmLinkPrompt != null) { alarmLinkPrompt.dismiss(); alarmLinkPrompt = null; }
+        pendingAlarmLink = id;
+        openPendingAlarmLink();
+    }
+
+    // Explicit, read-only navigation only. Alarm mutation still requires the regular editor.
+    private static long alarmLinkId(Intent intent) {
+        if (intent == null || !VIEW_ALARM_ACTION.equals(intent.getAction())) return -1;
+        Uri uri = intent.getData();
+        if (uri == null) return -1;
+        String raw = uri.toString();
+        String prefix = "openclock://alarm/";
+        if (!raw.startsWith(prefix)) return -1;
+        String number = raw.substring(prefix.length());
+        if (!number.matches("[1-9][0-9]{0,18}")) return -1;
+        try { return Long.parseLong(number); } catch (NumberFormatException ignored) { return -1; }
+    }
+
+    private void openPendingAlarmLink() {
+        if (pendingAlarmLink <= 0 || alarmLinkPrompt != null || isFinishing() || isDestroyed()) return;
+        boolean dirty = false;
+        if ("alarm".equals(screen) && draft != null) {
+            captureAlarm();
+            dirty = alarmBaseline == null || !alarmBaseline.equals(alarmSnapshot(draft));
+        } else if ("group".equals(screen)) {
+            dirty = groupBaseline == null || !groupBaseline.equals(groupSnapshot());
+        }
+        if (!dirty) { openLinkedAlarm(); return; }
+        AlertDialog prompt = new AlertDialog.Builder(this).setTitle("Open requested alarm?")
+                .setMessage("This screen has unsaved changes. Discard them to open the requested alarm?")
+                .setNegativeButton("Keep editing", (dialog, which) -> pendingAlarmLink = -1)
+                .setPositiveButton("Discard and open", (dialog, which) -> openLinkedAlarm())
+                .setOnCancelListener(dialog -> pendingAlarmLink = -1).create();
+        prompt.setOnDismissListener(dialog -> { if (alarmLinkPrompt == prompt) alarmLinkPrompt = null; });
+        alarmLinkPrompt = prompt;
+        prompt.show();
+    }
+
+    private void openLinkedAlarm() {
+        long id = pendingAlarmLink;
+        pendingAlarmLink = -1;
+        try {
+            JSONArray alarms = AlarmStore.alarms(this);
+            for (int i = 0; i < alarms.length(); i++) {
+                JSONObject alarm = alarms.optJSONObject(i);
+                if (alarm != null && alarm.optLong("id", -1) == id) { hideKeyboard(); editAlarm(alarm); return; }
+            }
+            toast("Alarm is no longer available");
+        } catch (RuntimeException e) { toast("Could not load the requested alarm"); }
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
+        state.putLong("pendingAlarmLink", pendingAlarmLink);
         rememberHomeScroll();
         state.putInt("homeScrollY", homeScrollY);
         state.putString("screen", screen);
