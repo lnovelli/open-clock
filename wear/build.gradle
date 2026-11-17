@@ -7,8 +7,8 @@ android {
         applicationId 'com.openclock'
         minSdk 26
         targetSdk 34
-        versionCode 23
-        versionName '2.10'
+        versionCode 24
+        versionName '2.11'
     }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     buildTypes { release { minifyEnabled false } }
@@ -24,11 +24,13 @@ tasks.register('prepareWatchEngine', Sync) {
                 'com/openclock/AlarmReceiver.java', 'com/openclock/RestoreReceiver.java',
                 'com/openclock/AlarmNotifications.java', 'com/openclock/RingingService.java',
                 'com/openclock/ClockApplication.java', 'com/openclock/AlarmConfirmation.java',
-                'com/openclock/UpdateChecker.java', 'com/openclock/GenericDismissProtocol.java'
+                'com/openclock/UpdateChecker.java', 'com/openclock/GenericDismissProtocol.java',
+                'com/openclock/AlarmOutputIcons.java'
         into 'java'
     }
     from('../app/src/main/res') {
-        include 'drawable/ic_alarm.xml', 'raw/alarm_sound.wav', 'xml/update_file_paths.xml'
+        include 'drawable/ic_alarm.xml', 'drawable/ic_alarm_sound.xml', 'drawable/ic_alarm_vibrate.xml',
+                'raw/alarm_sound.wav', 'xml/update_file_paths.xml'
         into 'res'
     }
     into layout.buildDirectory.dir('generated/watch-engine')

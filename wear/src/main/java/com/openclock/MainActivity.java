@@ -23,6 +23,7 @@ import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -612,7 +613,10 @@ public class MainActivity extends Activity {
         row.setPadding(dp(14), dp(8), dp(8), dp(8)); row.setMinimumHeight(dp(66)); row.setBackground(shape(CARD, 26));
         LinearLayout details = column(); details.setGravity(Gravity.CENTER_VERTICAL);
         TextView time = text(String.format(Locale.getDefault(), "%02d:%02d", a.optInt("hour"), a.optInt("minute")), 22, WHITE, true);
-        details.addView(time); String l = a.optString("label", "").trim();
+        LinearLayout timeLine = new LinearLayout(this); timeLine.setGravity(Gravity.CENTER_VERTICAL);
+        timeLine.addView(time, new LinearLayout.LayoutParams(-2, -2, 1));
+        AlarmOutputIcons.addTo(timeLine, a, MUTED, 14);
+        details.addView(timeLine, new LinearLayout.LayoutParams(-2, -2)); String l = a.optString("label", "").trim();
         String schedule = schedule(a); TextView sub = text((l.isEmpty() ? "Alarm" : l) + " · " + schedule, 11, MUTED, false);
         sub.setMaxLines(3); details.addView(sub);
         // The store owns pending state: even a past deadline can remain queued
@@ -649,7 +653,7 @@ public class MainActivity extends Activity {
             }
         });
         row.addView(toggle);
-        details.setContentDescription((phone ? "Phone" : "Watch") + " alarm " + time.getText()
+        details.setContentDescription((phone ? "Phone" : "Watch") + " alarm " + time.getText() + AlarmOutputIcons.description(a)
                 + ", " + sub.getText() + (snoozeDescription.isEmpty() ? "" : ", " + snoozeDescription)
                 + (!error.isEmpty() && !"null".equals(error) ? ", Not scheduled: " + error : "")
                 + ". Tap to edit; swipe left to delete, or touch and hold for actions.");
@@ -929,8 +933,8 @@ public class MainActivity extends Activity {
     private void timePage() {
         title("Time");
         LinearLayout pickers = new LinearLayout(this); pickers.setGravity(Gravity.CENTER);
-        NumberPicker h = picker(0, 23, hour, (p, old, val) -> hour = val);
-        NumberPicker m = picker(0, 59, minute, (p, old, val) -> minute = val);
+        NumberPicker h = picker(0, 23, hour, (p, old, val) -> { hour = val; p.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK); });
+        NumberPicker m = picker(0, 59, minute, (p, old, val) -> { minute = val; p.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK); });
         h.setDescendantFocusability(NumberPicker.FOCUS_BLOCK_DESCENDANTS);
         m.setDescendantFocusability(NumberPicker.FOCUS_BLOCK_DESCENDANTS);
         h.setContentDescription("Hour, 24 hour clock"); m.setContentDescription("Minute");

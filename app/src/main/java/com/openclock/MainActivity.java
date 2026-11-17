@@ -21,6 +21,7 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.text.InputFilter;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -458,7 +459,11 @@ public class MainActivity extends Activity {
         time.setFontFeatureSettings("tnum");
         time.setMaxLines(1);
         time.setAutoSizeTextTypeUniformWithConfiguration(24, 34, 1, android.util.TypedValue.COMPLEX_UNIT_SP);
-        info.addView(time);
+        LinearLayout timeLine = row();
+        timeLine.setGravity(Gravity.CENTER_VERTICAL);
+        timeLine.addView(time, new LinearLayout.LayoutParams(-2, -2, 1));
+        AlarmOutputIcons.addTo(timeLine, alarm, enabled ? MUTED : OFF, 18);
+        info.addView(timeLine, new LinearLayout.LayoutParams(-2, -2));
         String label = alarm.optString("label", "").trim();
         String description = scheduleText(alarm);
         TextView schedule = text(label.isEmpty() ? description : label + " · " + description, 13, enabled ? MUTED : OFF);
@@ -486,7 +491,7 @@ public class MainActivity extends Activity {
             error.setPadding(dp(2), dp(8), dp(8), 0);
             info.addView(error);
         }
-        info.setContentDescription("Edit alarm " + time.getText() + ", " + schedule.getText()
+        info.setContentDescription("Edit alarm " + time.getText() + AlarmOutputIcons.description(alarm) + ", " + schedule.getText()
                 + (snoozeDescription.isEmpty() ? "" : ", " + snoozeDescription));
         info.setOnClickListener(v -> editAlarm(alarm));
         info.setOnLongClickListener(v -> { alarmMenu(alarm); return true; });
@@ -672,6 +677,8 @@ public class MainActivity extends Activity {
         clock.setPadding(dp(14), 0, dp(14), dp(20));
         hourPicker = numberPicker(0, 23, draft.optInt("hour", 7), true);
         minutePicker = numberPicker(0, 59, draft.optInt("minute"), true);
+        hourPicker.setOnValueChangedListener((picker, oldValue, newValue) -> picker.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK));
+        minutePicker.setOnValueChangedListener((picker, oldValue, newValue) -> picker.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK));
         hourPicker.setContentDescription("Hour, 24-hour time");
         minutePicker.setContentDescription("Minute");
         clock.addView(hourPicker, new LinearLayout.LayoutParams(0, dp(164), 1));
