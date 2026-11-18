@@ -127,10 +127,27 @@ final class AlarmNotifications {
             c.getSystemService(NotificationManager.class).notify("problem",20,n);
         } catch(SecurityException ignored) { /* MainActivity also exposes accessProblem(). */ }
     }
+    /** Informational pending state: no sound or vibration and no repeated alert. */
+    static synchronized void phoneFallbackPending(Context c,String message) {
+        try {
+            NotificationManager nm=c.getSystemService(NotificationManager.class);
+            String channel="phone_fallback_pending_v1";
+            NotificationChannel ch=new NotificationChannel(channel,"Phone fallback synchronization",NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("Background phone alarm synchronization in progress.");
+            ch.setSound(null,null); ch.enableVibration(false);
+            nm.createNotificationChannel(ch);
+            Notification n=new Notification.Builder(c,channel).setSmallIcon(R.drawable.ic_alarm)
+                .setContentTitle("Phone alarm synchronization").setContentText(message)
+                .setStyle(new Notification.BigTextStyle().bigText(message)).setOnlyAlertOnce(true)
+                .setAutoCancel(true).setContentIntent(PendingIntent.getActivity(c,0,new Intent(c,MainActivity.class),PendingIntent.FLAG_IMMUTABLE)).build();
+            nm.notify("phone-fallback-pending",20,n);
+        } catch(RuntimeException ignored) { /* The watch app also displays the status. */ }
+    }
     /** Clear only our fallback warning, never a different scheduling or ringing warning. */
     static synchronized void clearPhoneFallbackWarning(Context c,boolean journalOnly) {
         try {
             NotificationManager nm=c.getSystemService(NotificationManager.class);
+            nm.cancel("phone-fallback-pending",20);
             for(android.service.notification.StatusBarNotification shown:nm.getActiveNotifications()) {
                 if(!"problem".equals(shown.getTag())||shown.getId()!=20) continue;
                 CharSequence text=shown.getNotification().extras.getCharSequence(Notification.EXTRA_TEXT);

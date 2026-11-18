@@ -266,14 +266,117 @@ public final class PhoneMirror {
         }
         if (silenced) localChanged(c);
     }
+    /**
+     * A shake has one cutoff across local and mirror state. The anchor must still
+     * be live; sessions arriving after the locks are released are not affected.
+     * Lock order matches snapshot and individual mirror admission.
+     */
+    static void dismissAllFromShake(Context context, boolean localAnchor, long id, String token) throws Exception {
+        if (id <= 0 || token == null || token.isEmpty()) return;
+        Context c = context.getApplicationContext();
+        PhoneDismissalJob.beforeCommit(c);
+        boolean queued = false, committed = false, hadFallback = false;
+        boolean mirrorChanged = false, mirrorPersistenceFailed = false, mirrorStateUnavailable = false;
+        Exception commitFailure = null;
+        synchronized (LOCK) {
+            synchronized (PhoneSync.class) {
+                synchronized (AlarmStore.class) {
+                    JSONObject snapshot = PhoneSync.cached(c);
+                    JSONArray state;
+                    try { state = records(c); }
+                    catch (Exception unreadable) { state = new JSONArray(); mirrorStateUnavailable = true; }
+                    JSONArray local = AlarmStore.active(c);
+                    List<JSONObject> mirrors = new ArrayList<>();
+                    JSONArray identities = new JSONArray();
+                    // A snapshot can have committed before its onSnapshot callback
+                    // creates records. Include those validated active sessions too.
+                    if (!mirrorStateUnavailable && snapshot != null && snapshot.opt("active") instanceof JSONArray) try {
+                        Set<String> dismissed = AlarmStore.mirrorDismissalKeys(c);
+                        Set<String> consumed = PhoneSync.mirrorDismissalsInOutbox(c, snapshot);
+                        long now = System.currentTimeMillis();
+                        for (JSONObject a : validate(snapshot)) {
+                            JSONObject r = record(state, a.optString("token"));
+                            if ((r != null && (r.optBoolean("closed") || r.optLong("id") != a.optLong("id")))
+                                    || dismissed.contains(identity(a)) || suppressedInProcess.contains(identity(a))
+                                    || consumed.contains(a.optLong("id") + ":" + a.optString("occurrenceId", ""))
+                                    || a.optLong("startedAt") > now + 60_000 || remaining(c, a) <= 0) continue;
+                            if (r != null && (r.optLong("expiresAt") <= now)) continue;
+                            JSONObject pinned = PhoneSync.mirrorIdentity(c, a.optLong("id"), a.optString("token"));
+                            if (pinned != null) { mirrors.add(a); identities.put(pinned); }
+                        }
+                    } catch (Exception unreadable) {
+                        mirrors.clear(); identities = new JSONArray(); mirrorStateUnavailable = true;
+                    }
+                    boolean admitted = localAnchor ? AlarmStore.active(c, id, token) != null : false;
+                    if (!localAnchor) for (JSONObject a : mirrors)
+                        if (a.optLong("id") == id && token.equals(a.optString("token"))) { admitted = true; break; }
+                    if (!admitted) return;
+                    for (int i = 0; i < local.length(); i++) {
+                        JSONObject a = local.optJSONObject(i);
+                        if (a != null && a.optBoolean("_phoneFallback")) hadFallback = true;
+                    }
+                    try {
+                        // Store contract: one commit closes only the currently valid
+                        // local sessions (including fallback occurrence tombstones),
+                        // records these exact mirror identities and enqueues one
+                        // generic request. Never cancel snoozed/future generations.
+                        // False means outbox full, not that local dismissal failed.
+                        queued = AlarmStore.shakeDismissAll(c, identities);
+                        committed = true;
+                    } catch (Exception failure) { commitFailure = failure; }
+                    // Preserve immediate mirror silence even on a storage failure;
+                    // store tombstones protect replay if preference persistence fails.
+                    for (JSONObject a : mirrors) {
+                        suppressedInProcess.add(identity(a));
+                        JSONObject r = record(state, a.optString("token"));
+                        if (r == null && state.length() < MAX_TOKENS) {
+                            r = new JSONObject().put("id", a.getLong("id")).put("token", a.getString("token"))
+                                    .put("expiresAt", a.getLong("expiresAt"));
+                            state.put(r);
+                        }
+                        if (r != null) r.put("closed", true); else mirrorPersistenceFailed = true;
+                        cancel(c, a);
+                        mirrorChanged = true;
+                    }
+                    if (mirrorChanged && !save(c, state)) mirrorPersistenceFailed = true;
+                    if (committed) {
+                        // The store lock excludes a new fire until cancellation is
+                        // complete. Never cancel a replacement session's notice.
+                        JSONArray current = AlarmStore.active(c);
+                        for (int i = 0; i < local.length(); i++) {
+                            JSONObject old = local.optJSONObject(i);
+                            if (old == null) continue;
+                            long localId = old.optLong("id");
+                            if (AlarmStore.find(current, localId) == null) try {
+                                c.getSystemService(NotificationManager.class).cancel("alarm:" + localId, 11);
+                            } catch (RuntimeException ignored) { }
+                        }
+                    }
+                }
+            }
+        }
+        if (committed) {
+            AlarmStore.refreshService(c);
+            if (hadFallback) WearSync.afterPhoneFallbackOccurrence(c);
+            PhoneDismissalJob.schedule(c);
+        }
+        if (mirrorChanged) localChanged(c);
+        if (commitFailure != null) {
+            android.util.Log.w("PhoneMirror", "Shake dismissal could not be committed", commitFailure);
+            AlarmNotifications.warning(c, "Some alarms may still ring; use alarm controls. Phone dismissal not confirmed.");
+        } else if (!queued) {
+            AlarmNotifications.warning(c, "Dismissed on watch only; phone dismissal could not be queued.");
+        } else {
+            android.widget.Toast.makeText(c, "Phone dismissal not confirmed", android.widget.Toast.LENGTH_LONG).show();
+        }
+        if (mirrorStateUnavailable)
+            AlarmNotifications.warning(c, "Mirror state unavailable; check phone alarms.");
+        if (mirrorPersistenceFailed && !committed)
+            AlarmNotifications.warning(c, "Mirror silence may not survive restart.");
+    }
+
     /** User dismissal of a live mirror: silence locally, then try the phone separately. */
     static boolean dismiss(Context context, long id, String token) {
-        return dismiss(context, id, token, false);
-    }
-    static boolean dismissFromShake(Context context, long id, String token) {
-        return dismiss(context, id, token, true);
-    }
-    private static boolean dismiss(Context context, long id, String token, boolean requireNoLocal) {
         if (id <= 0 || token == null) return false;
         Context c = context.getApplicationContext();
         PhoneDismissalJob.beforeCommit(c);
@@ -283,19 +386,7 @@ public final class PhoneMirror {
                 synchronized (PhoneSync.class) {
                     identity = PhoneSync.mirrorIdentity(c, id, token);
                     if (identity == null) return false;
-                    if (requireNoLocal) {
-                        // Preserve shake's local-first admission without taking
-                        // the store lock before mirror/sync locks.
-                        synchronized (AlarmStore.class) {
-                            if (AlarmStore.active(c).length() != 0) return false;
-                            JSONObject first = null;
-                            for (JSONObject candidate : liveLocked(c, PhoneSync.cached(c), records(c)))
-                                if (first == null || candidate.optLong("id") < first.optLong("id")) first = candidate;
-                            if (first == null || first.optLong("id") != id
-                                    || !token.equals(first.optString("token"))) return false;
-                            result=silenceLocked(c, identity);
-                        }
-                    } else result=silenceLocked(c, identity);
+                    result=silenceLocked(c, identity);
                     if (result==null) return false;
                 }
             } catch (Exception invalid) { return false; }

@@ -1,6 +1,5 @@
 package com.openclock;
 
-import android.app.NotificationManager;
 import android.content.Context;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -183,34 +182,16 @@ final class WatchShakeBridge implements SensorEventListener {
             return;
         }
         try {
-            if (detected.local) {
-                JSONObject dismissed = null;
-                synchronized (AlarmStore.class) {
-                    // Select local priority without consulting mirror/sync while
-                    // holding the store lock (sync itself can acquire this lock).
-                    JSONArray local = AlarmStore.active(app);
-                    Target best = null;
-                    for (int i = 0; i < local.length(); i++) {
-                        JSONObject a = local.optJSONObject(i), s = a == null ? null : a.optJSONObject("_active");
-                        if (s == null) continue;
-                        Target candidate = new Target(true, a.optLong("id"), s.optString("token"));
-                        if (candidate.id > 0 && !candidate.token.isEmpty() && (best == null || candidate.id < best.id)) best = candidate;
-                    }
-                    if (!localService || !detected.same(best)) return;
-                    dismissed = AlarmStore.active(app, detected.id, detected.token);
-                    if (dismissed == null) return;
-                    AlarmStore.finish(app, detected.id, detected.token, false);
-                    try { app.getSystemService(NotificationManager.class).cancel("alarm:" + detected.id, 11); }
-                    catch (RuntimeException ignored) { }
-                }
-                PhoneMirror.localDismissed(app, dismissed);
-                AlarmStore.refreshService(app);
-            } else if (mirrorService) {
-                // Admission atomically checks local priority using mirror -> sync -> store.
-                PhoneMirror.dismissFromShake(app, detected.id, detected.token);
-            }
-        } catch (Exception ignored) { /* leave normal controls and ringing intact */ }
-        finally { reconcile(); }
+            // The selected session is only an admission anchor. PhoneMirror takes
+            // mirror -> sync -> store locks and captures the entire live set at
+            // one cutoff; it never broadens individual notification dismissals.
+            if ((detected.local && localService) || (!detected.local && mirrorService))
+                PhoneMirror.dismissAllFromShake(app, detected.local, detected.id, detected.token);
+        } catch (Exception failure) {
+            Log.w(TAG, "Could not dismiss alarms from shake", failure);
+            try { AlarmNotifications.warning(app, "Shake dismissal failed; use alarm controls."); }
+            catch (RuntimeException ignored) { }
+        } finally { reconcile(); }
     }
 
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }

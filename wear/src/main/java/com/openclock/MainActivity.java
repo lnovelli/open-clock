@@ -105,7 +105,7 @@ public class MainActivity extends Activity {
     private long awaitingAfter;
     private final BroadcastReceiver phoneChanged = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
-            if (WearSync.LOCAL_CHANGED.equals(intent.getAction())) {
+            if (WearSync.LOCAL_CHANGED.equals(intent.getAction()) || "com.openclock.PHONE_MIRROR_CHANGED".equals(intent.getAction())) {
                 if (page == 0) renderListIfChanged();
                 return;
             }
@@ -199,6 +199,7 @@ public class MainActivity extends Activity {
         super.onStart();
         IntentFilter filter = new IntentFilter(PhoneSync.ACTION_CHANGED);
         filter.addAction(WearSync.LOCAL_CHANGED);
+        filter.addAction("com.openclock.PHONE_MIRROR_CHANGED");
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(phoneChanged, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(phoneChanged, filter);
         registered = true;
@@ -266,6 +267,7 @@ public class MainActivity extends Activity {
             // Both complete row arrays include snoozedUntil, so pending snooze
             // changes redraw the list without adding revisions or timestamps.
             return new JSONObject().put("watch", AlarmStore.alarms(this))
+                .put("ringing", AlarmStore.active(this)).put("mirrors", new JSONArray(PhoneMirror.live(this)))
                 .put("alarms", cache.optJSONArray("alarms")).put("groups", cache.optJSONArray("groups"))
                 .put("connected", connected(cache)).put("fresh", updated > 0 && age >= 0 && age <= FRESH_MS)
                 .put("pending", new JSONArray(new java.util.TreeSet<>(pending)))
@@ -342,6 +344,7 @@ public class MainActivity extends Activity {
     }
     private void list() {
         title("Alarm");
+        activeControls();
         permissions();
         section("Watch alarms");
         try {
@@ -362,6 +365,37 @@ public class MainActivity extends Activity {
         add(button("Do Not Disturb", CARD, this::dndHelp), 20);
         add(button("Test double shake", CARD, () -> startActivity(new Intent(this, ShakeTestActivity.class))), 20);
         add(button("Check for updates", CARD, () -> UpdateChecker.show(this, "watch")), 20);
+    }
+
+    private void activeControls() {
+        JSONArray local = AlarmStore.active(this);
+        java.util.List<JSONObject> mirrors = PhoneMirror.live(this);
+        if (local.length() == 0 && mirrors.isEmpty()) return;
+        section("Ringing now");
+        for (int i = 0; i < local.length(); i++) {
+            JSONObject alarm = local.optJSONObject(i);
+            if (alarm == null || alarm.optJSONObject("_active") == null) continue;
+            String label = alarm.optString("label", "").trim();
+            String origin = alarm.optBoolean("_phoneFallback") ? "Phone fallback" : "Watch alarm";
+            String text = origin + (label.isEmpty() ? "" : ": " + label);
+            long id = alarm.optLong("id");
+            String token = alarm.optJSONObject("_active").optString("token");
+            add(button(text, 0xff4b287f, () -> {
+                JSONObject current = AlarmStore.active(this, id, token);
+                if (current != null) startActivity(AlarmNotifications.alertIntent(this, current));
+                else renderListIfChanged();
+            }), 8);
+        }
+        for (JSONObject alarm : mirrors) {
+            String label = alarm.optString("label", "").trim();
+            String text = "Phone alarm" + (label.isEmpty() ? "" : ": " + label);
+            long id = alarm.optLong("id"); String token = alarm.optString("token");
+            add(button(text, 0xff4b287f, () -> {
+                JSONObject current = PhoneMirror.current(this, id, token);
+                if (current != null) startActivity(PhoneMirror.openIntent(this, current));
+                else renderListIfChanged();
+            }), 8);
+        }
     }
 
     private void dndHelp() {
@@ -829,7 +863,7 @@ public class MainActivity extends Activity {
         long age = System.currentTimeMillis() - updated;
         String fallbackProblem = PhoneFallback.problem(this);
         if (!fallbackProblem.isEmpty()) note("Watch phone-alarm fallback problem: " + fallbackProblem);
-        else note("Watch schedules phone alarms independently from the last snapshot, even offline. Changes may be stale; both devices may ring. Dismiss/snooze separately.");
+        else note("Watch schedules phone alarms independently from the last snapshot, even offline. Changes may be stale; both devices may ring. A matching phone snooze can synchronize when connected.");
         if (!online) note("Phone unavailable. Cached alarms may be stale; controls are disabled.");
         else if (updated <= 0 || age < 0 || age > FRESH_MS) note("Phone connected · snapshot is stale or not yet available.");
 

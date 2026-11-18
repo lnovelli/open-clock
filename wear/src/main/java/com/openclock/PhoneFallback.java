@@ -19,8 +19,12 @@ final class PhoneFallback {
             String problem=AlarmStore.phoneFallbackProblem(c);
             if(!status(c).edit().putBoolean("initialized",true).putBoolean("journalProblem",true)
                     .putString("problem",problem==null?"":problem).commit()) return false;
-            if(problem!=null) AlarmNotifications.warning(c,"Phone fallback: "+problem);
-            else AlarmNotifications.clearPhoneFallbackWarning(c,false);
+            if("Phone fallback changes pending; retry scheduled".equals(problem))
+                AlarmNotifications.phoneFallbackPending(c,"Phone fallback: "+problem);
+            else if(problem!=null) {
+                AlarmNotifications.clearPhoneFallbackWarning(c,true);
+                AlarmNotifications.warning(c,"Phone fallback: "+problem);
+            } else AlarmNotifications.clearPhoneFallbackWarning(c,false);
             return problem==null;
         } catch(Exception e) {
             String problem="Phone fallback not synchronized: "+AlarmStore.message(e);
