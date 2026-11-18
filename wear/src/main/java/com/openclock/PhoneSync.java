@@ -146,6 +146,7 @@ public final class PhoneSync {
         catch (Exception ignored) { return false; /* A later event or job retries. */ }
     }
     private static void broadcast(Context c) { MAIN.post(()->{
+        WatchSnooze.recover(c);
         c.sendBroadcast(new Intent(ACTION_CHANGED).setPackage(c.getPackageName()));
         ComplicationUpdateJob.changed(c, false);
     }); }
@@ -265,6 +266,7 @@ public final class PhoneSync {
             } else if("finish".equals(op)) {
                 if(input.length()!=4||!(input.opt("snooze") instanceof Boolean)||!(input.opt("token") instanceof String)) throw new IllegalArgumentException();
                 value=input.getBoolean("snooze"); token=input.getString("token");
+                if(value) throw new IllegalArgumentException("Use ownership-aware snooze");
                 if(!token.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")) throw new IllegalArgumentException();
             } else throw new IllegalArgumentException();
             synchronized(PhoneSync.class) {
@@ -797,6 +799,7 @@ public final class PhoneSync {
         } catch(Exception ignored) { }
     }
     static void reply(Context context,String node,String path,byte[] body) {
+        if(SnoozeProtocol.REPLY.equals(path)) { WatchSnooze.reply(context.getApplicationContext(),node,body); return; }
         if(GenericDismissProtocol.REPLY.equals(path)) { PhoneDismissalJob.reply(context.getApplicationContext(),node,body); return; }
         if(CREATE_REPLY.equals(path)) { createReply(context.getApplicationContext(),node,body); return; }
         if(MUTATE_REPLY.equals(path)) { mutationReply(context.getApplicationContext(),node,body); return; }
@@ -834,6 +837,80 @@ public final class PhoneSync {
         MAIN.post(()->callback.onResult(ok,message));
         broadcast(c);
         startFetch(c,true);
+    }
+    static synchronized JSONObject snoozeTemplate(Context c,JSONObject mirror) throws Exception {
+        load(c); JSONObject template=new JSONObject(mirror.toString());
+        JSONObject saved=AlarmStore.find(snapshot.getJSONArray("alarms"),mirror.getLong("id"));
+        if(saved!=null) for(String k:new String[]{"label","sound","vibrate","vibrationPattern","snoozeEnabled","snoozeMinutes","snoozeCount"})
+            if(saved.has(k)) template.put(k,saved.get(k));
+        // Older mirrors may omit the count, but an exact published lineage can establish it.
+        if(!template.has("snoozeUsed")&&saved!=null) {
+            JSONArray lineage=saved.optJSONArray("snoozeLineage");
+            if(lineage!=null) for(int i=0;i<lineage.length();i++) {
+                JSONObject transition=lineage.getJSONObject(i);
+                if(mirror.optString("occurrenceId").equals(transition.optString("nextOccurrenceId"))) template.put("snoozeUsed",transition.getInt("snoozeUsed"));
+            }
+        }
+        if(!template.has("snoozeUsed")) {
+            JSONObject known=AlarmStore.mirrorSnoozeTemplate(c,mirrorIdentity(c,mirror.getLong("id"),mirror.getString("token")),template);
+            if(known!=null) template=known;
+        }
+        return template;
+    }
+    /** Exact accepted owner/epoch/occurrence join, never an ID/time guess. */
+    static synchronized JSONObject snoozeIdentity(Context c,JSONObject local,boolean mirror) throws Exception {
+        load(c);
+        JSONObject origin;
+        if(mirror) {
+            origin=mirrorIdentity(c,local.getLong("id"),local.getString("token"));
+            if(origin==null) return null;
+            origin.put("mirrorToken",origin.getString("token"));
+        } else {
+            JSONObject live=local.getJSONObject("_active");
+            origin=new JSONObject().put("node",local.getString("_phoneNode")).put("epoch",local.getString("_phoneEpoch"))
+                .put("id",local.getLong("_phoneId")).put("occurrenceId",live.optString("occurrenceId")).put("token","");
+        }
+        if(!origin.optString("node").equals(owner)||!origin.optString("epoch").equals(snapshot.optString("epoch"))) { origin.put("token",""); return origin; }
+        JSONArray active=snapshot.optJSONArray("active"); JSONObject match=null;
+        if(active!=null) for(int i=0;i<active.length();i++) {
+            JSONObject a=active.getJSONObject(i);
+            if(a.optLong("id")==origin.optLong("id")&&SnoozeProtocol.uuid(origin.optString("occurrenceId"))
+                &&origin.getString("occurrenceId").equals(a.optString("occurrenceId"))&&a.optLong("expiresAt")>System.currentTimeMillis()) {
+                if(match!=null) { origin.put("token",""); return origin; } match=a;
+            }
+        }
+        if(match!=null) origin.put("mirrorToken",match.getString("token"));
+        origin.put("token",match==null||snapshot.optInt("snoozeProtocol")!=2?"":match.getString("token")); return origin;
+    }
+    /** Background-only; no store/UI/identity lock held across transport. No write retries. */
+    static void sendSnooze(Context c,JSONObject record,boolean status) throws Exception {
+        JSONObject request=record.getJSONObject("request"); String node=record.getString("node");
+        synchronized(PhoneSync.class) {
+            load(c);
+            if(!node.equals(owner)||!request.getString("epoch").equals(snapshot.optString("epoch"))
+                ||snapshot.optInt("snoozeProtocol")!=2) throw new IllegalStateException("Phone ownership unverified");
+        }
+        if(!node.equals(onePhone(c))) throw new IllegalStateException("Phone unavailable");
+        synchronized(PhoneSync.class) {
+            if(!node.equals(owner)||!request.getString("epoch").equals(snapshot.optString("epoch"))) throw new IllegalStateException("Phone changed");
+        }
+        if(!status) {
+            boolean pending=false; JSONArray requests=AlarmStore.watchSnoozeRequests(c);
+            for(int i=0;i<requests.length();i++) {
+                JSONObject current=requests.getJSONObject(i);
+                if(record.getString("requestId").equals(current.optString("requestId"))&&"pending".equals(current.optString("state"))&&!current.has("receipt")) pending=true;
+            }
+            if(!pending) throw new IllegalStateException("Snooze already resolved locally");
+            if(record.optLong("localId")>0&&AlarmStore.active(c,record.optLong("localId"),record.optString("localToken"))==null)
+                throw new IllegalStateException("Watch occurrence changed");
+            if(record.optLong("localId")==0&&PhoneMirror.current(c,record.optLong("phoneId"),record.optString("localToken"))==null)
+                throw new IllegalStateException("Mirror occurrence changed");
+        }
+        Tasks.await(Wearable.getMessageClient(c).sendMessage(node,status?SnoozeProtocol.STATUS:SnoozeProtocol.REQUEST,
+            request.toString().getBytes(StandardCharsets.UTF_8)),3,TimeUnit.SECONDS);
+    }
+    static synchronized boolean fallbackOwner(Context c,String node,String epoch) {
+        load(c); return node.equals(owner)&&epoch.equals(snapshot.optString("epoch"));
     }
     private PhoneSync() { }
 }

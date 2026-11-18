@@ -16,6 +16,7 @@ public final class AlarmReceiver extends BroadcastReceiver {
             } else if("com.openclock.DISMISS".equals(action)||"com.openclock.SNOOZE".equals(action)) {
                 // Reject stale notification actions before either mutating the store or
                 // cancelling the per-alarm notification for a newer occurrence.
+                if("com.openclock.SNOOZE".equals(action)&&WearSync.routeSnooze(c,id,token,null)) return;
                 org.json.JSONObject dismissed;
                 synchronized(AlarmStore.class) {
                     dismissed=AlarmStore.active(c,id,token);

@@ -41,6 +41,8 @@ final class WearSync {
     // No Binder, disk, network or publisher lock under the AlarmStore lock.
     // Consequently a process death between commit and asynchronous scheduling can
     // lose this advisory wakeup; a later commit or watch refresh repairs it.
+    static void recoverSnoozes(Context c) { }
+    static boolean routeSnooze(Context c,long id,String token,Integer minutes) { return false; }
     static void beforeCommit(Context c) { }
     static boolean enqueueGenericDismissal(JSONObject state) { return true; }
     static void afterPhoneFallbackOccurrence(Context c) { }

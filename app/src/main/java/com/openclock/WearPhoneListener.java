@@ -18,7 +18,7 @@ public final class WearPhoneListener extends WearableListenerService {
         final String path=e.getPath(), node=e.getSourceNodeId();
         final byte[] body=e.getData();
         if(node==null||node.isEmpty()||node.length()>256||body==null||body.length>(WearSync.MUTATE.equals(path)?8192:1024)||
-            !(WearSync.REQUEST.equals(path)||WearSync.COMMAND.equals(path)||WearSync.DISMISS.equals(path)||GenericDismissProtocol.REQUEST.equals(path)||WearSync.CREATE.equals(path)||WearSync.CREATE_STATUS.equals(path)||WearSync.MUTATE.equals(path)||WearSync.MUTATE_STATUS.equals(path))) return;
+            !(SnoozeProtocol.REQUEST.equals(path)||SnoozeProtocol.STATUS.equals(path)||WearSync.REQUEST.equals(path)||WearSync.COMMAND.equals(path)||WearSync.DISMISS.equals(path)||GenericDismissProtocol.REQUEST.equals(path)||WearSync.CREATE.equals(path)||WearSync.CREATE_STATUS.equals(path)||WearSync.MUTATE.equals(path)||WearSync.MUTATE_STATUS.equals(path))) return;
         // WearableListenerService dispatches on a background thread. Finish the
         // bounded request before returning so its service binding protects it.
         handle(node,path,body);
@@ -144,6 +144,22 @@ public final class WearPhoneListener extends WearableListenerService {
                 .getCapability("openclock_watch_v1",CapabilityClient.FILTER_REACHABLE),5,TimeUnit.SECONDS);
             boolean found=false; for(Node n:info.getNodes()) if(node.equals(n.getId())) found=true;
             if(!found) return;
+            if(SnoozeProtocol.REQUEST.equals(path)||SnoozeProtocol.STATUS.equals(path)) {
+                JSONObject request=new JSONObject(new String(body,StandardCharsets.UTF_8));
+                SnoozeProtocol.validate(request);
+                if(!WearSync.epoch(this).equals(request.getString("epoch"))||
+                    !Tasks.await(Wearable.getNodeClient(this).getLocalNode(),3,TimeUnit.SECONDS).getId().equals(request.getString("owner"))) return;
+                JSONObject receipt=null; String status="unknown";
+                try {
+                    receipt=SnoozeProtocol.REQUEST.equals(path)?AlarmStore.wearSnooze(this,node,request):AlarmStore.wearSnoozeReceipt(this,node,request);
+                } catch(AlarmStore.WearReceiptCapacityException full) { status="capacity"; }
+                catch(AlarmStore.WearSnoozeRejectedException rejected) { status="rejected"; }
+                catch(Exception uncertain) { /* Only a durable positive receipt proves commit. */ }
+                JSONObject reply=new JSONObject().put("version",2).put("request",request).put("status",receipt==null?status:"committed");
+                if(receipt!=null) { reply.put("receipt",receipt); WearSync.publishSoon(this); }
+                Tasks.await(Wearable.getMessageClient(this).sendMessage(node,SnoozeProtocol.REPLY,reply.toString().getBytes(StandardCharsets.UTF_8)),3,TimeUnit.SECONDS);
+                return;
+            }
             if(WearSync.REQUEST.equals(path)) { WearSync.requestFromListener(this); return; }
             if(GenericDismissProtocol.REQUEST.equals(path)) { handleDismissAll(node,body); return; }
             if(WearSync.DISMISS.equals(path)) { handleDismiss(node,body); return; }

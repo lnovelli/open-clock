@@ -132,6 +132,13 @@ public final class AlarmActivity extends Activity {
 
     private void complete(boolean snooze) {
         try {
+            if(snooze) {
+                WatchSnooze.local(this,id,token,null,(ok,message)->{
+                    Toast.makeText(this,message,Toast.LENGTH_LONG).show();
+                    if(ok) finish();
+                });
+                return;
+            }
             JSONObject dismissed = null;
             // Store operations are synchronized on this same lock. Keep validation,
             // mutation and notification cancellation together so a stale screen cannot

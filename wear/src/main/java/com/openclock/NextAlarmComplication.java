@@ -45,8 +45,11 @@ public final class NextAlarmComplication extends ComplicationDataSourceService {
                         phone.optString("epoch"), phone.optLong("revision", -1));
                 if (remaining == 0) result.uncertain = true;
                 else certainUntil = now + remaining;
-                result.rows("phone", phone.getJSONArray("alarms"), phone.getJSONArray("active"), now);
-            } catch (Exception e) { result.uncertain = true; }
+                WatchSchedule.select(result,WatchSchedule.read(this,phone),now);
+            } catch (Exception e) {
+                result.uncertain = true;
+                try { WatchSchedule.select(result,WatchSchedule.read(this,null),now); } catch(Exception ignored) { }
+            }
             ComplicationDisplay display = display();
             // Old watch faces display only the default: always mark unverified state.
             ComplicationData fallback = data(type, Collections.emptyList(), true, now, display);

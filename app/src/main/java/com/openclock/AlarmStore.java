@@ -55,6 +55,13 @@ public final class AlarmStore {
             boolean needsRecovery=false;
             JSONArray proposedStages=state.optJSONArray("_phoneStaged"), priorStages=priorState.optJSONArray("_phoneStaged");
             if(proposedStages!=null&&(priorStages==null||proposedStages.length()>priorStages.length())) needsRecovery=true;
+            JSONArray requests=state.optJSONArray("_watchSnoozes"), priorRequests=priorState.optJSONArray("_watchSnoozes");
+            if(requests!=null) for(int i=0;i<requests.length();i++) {
+                JSONObject request=requests.getJSONObject(i); boolean existed=false;
+                if(priorRequests!=null) for(int j=0;j<priorRequests.length();j++)
+                    if(request.optString("requestId").equals(priorRequests.getJSONObject(j).optString("requestId"))) existed=true;
+                if(!existed) needsRecovery=true;
+            }
             JSONArray proposed=state.getJSONArray("alarms");
             for(int i=0;i<proposed.length();i++) {
                 JSONObject a=proposed.getJSONObject(i), old=find(previous,a.optLong("id"));
@@ -103,6 +110,7 @@ public final class AlarmStore {
         for(String k:remove) out.remove(k);
         if(!out.has("vibrationPattern")) out.put("vibrationPattern","basic");
         out.put("nextTriggerAt", a.optLong("_nextAt",0));
+        if(a.optBoolean("_watchOnlySnooze")) out.put("watchOnlySnooze",true).put("ownershipWarning","Watch-only snooze; phone may still ring");
         // Expose pending snooze independently of the ordinary alarm time. Keep
         // due/queued snoozes visible until fire, disable, or recovery clears them.
         out.put("snoozedUntil", a.optBoolean("enabled") && !a.has("_active") ? a.optLong("_snoozeAt",0) : 0);
@@ -111,6 +119,7 @@ public final class AlarmStore {
     }
     public static synchronized JSONArray alarms(Context c) {
         try {
+            migrateLegacyWatchSnoozes(c);
             JSONArray source=state(c).getJSONArray("alarms"), result=new JSONArray();
             String problem=accessProblem(c);
             for(int i=0;i<source.length();i++) {
@@ -121,7 +130,7 @@ public final class AlarmStore {
                 result.put(a);
             }
             return result;
-        } catch(JSONException e) { throw new IllegalStateException(e); }
+        } catch(Exception e) { throw new IllegalStateException(e); }
     }
     public static synchronized JSONArray groups(Context c) {
         try { return new JSONArray(state(c).getJSONArray("groups").toString()); }
@@ -131,6 +140,7 @@ public final class AlarmStore {
      * local ID namespace, generation tokens, recovery and registration protocol. */
     static synchronized void syncPhoneFallback(Context c, String node, JSONObject snapshot) throws Exception {
         cleanupPhoneStaged(c);
+        migrateLegacyWatchSnoozes(c);
         String epoch=snapshot.getString("epoch"); long revision=snapshot.getLong("revision"), published=snapshot.getLong("updatedAt");
         if(node.isEmpty()||!epoch.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")||revision<0||published<=0)
             throw new IllegalArgumentException("Invalid phone snapshot identity");
@@ -205,7 +215,10 @@ public final class AlarmStore {
                 JSONObject old=rows.getJSONObject(i); if(!old.optBoolean("_phoneFallback")) continue;
                 boolean present=same&&node.equals(old.optString("_phoneNode"))&&epoch.equals(old.optString("_phoneEpoch"))&&ids.contains(old.optLong("_phoneId"));
                 if(!present) {
-                    if(protectPhoneOccurrence(old,now)) { old.put("_phoneRetired",true); pending=true; }
+                    if(protectRemovedPhoneOccurrence(old,now)) {
+                        retirePhoneFuture(old,now,obsolete);
+                        old.put("_phoneRetired",true); pending=true;
+                    }
                     else { rows.remove(i); obsolete.add(old); fallbackCount--; }
                 }
             }
@@ -215,6 +228,7 @@ public final class AlarmStore {
                     if(r.optBoolean("_phoneFallback")&&node.equals(r.optString("_phoneNode"))&&epoch.equals(r.optString("_phoneEpoch"))&&r.optLong("_phoneId")==phoneId) { old=r; break; }
                 }
                 if(old!=null) {
+                    applyPhoneSnoozeCount(old,active,src.optJSONArray("_sourceSnoozes"));
                     // A watch-local snooze/dismiss wins over a concurrently received
                     // phone transition. Keep the durable desired snapshot pending.
                     JSONArray lineage=src.optJSONArray("_sourceSnoozes");
@@ -231,7 +245,23 @@ public final class AlarmStore {
                             JSONObject session=active.optJSONObject(j);
                             if(session!=null&&session.optLong("id")==phoneId&&descendant.equals(session.optString("occurrenceId"))) conflict=true;
                         }
-                        if(conflict) { pending=true; continue; }
+                        if(conflict) {
+                            boolean confirmed=false; JSONArray requests=s.optJSONArray("_watchSnoozes");
+                            JSONObject proof=old.optJSONObject("_phoneSnoozeReceipt");
+                            if(proof!=null&&consumed.equals(proof.optString("occurrenceId")))
+                                for(int k=0;k<lineage.length();k++)
+                                    if(proof.optString("nextOccurrenceId").equals(lineage.getJSONObject(k).optString("nextOccurrenceId"))) confirmed=true;
+                            if(requests!=null) for(int j=0;j<requests.length();j++) {
+                                JSONObject request=requests.getJSONObject(j), receipt=request.optJSONObject("receipt");
+                                if(receipt!=null&&node.equals(request.optString("node"))&&epoch.equals(request.optString("epoch"))
+                                    &&phoneId==request.optLong("phoneId")&&consumed.equals(request.optString("occurrenceId"))) {
+                                    for(int k=0;k<lineage.length();k++)
+                                        if(receipt.optString("nextOccurrenceId").equals(lineage.getJSONObject(k).optString("nextOccurrenceId"))) confirmed=true;
+                                }
+                            }
+                            if(!confirmed) { pending=true; continue; }
+                            old.remove("_phoneConsumedOccurrenceId");
+                        }
                     }
                     JSONObject replacement;
                     try { replacement=phoneSnoozeReplacement(c,src,old,active,now,registrations,activeHistory,node,epoch); }
@@ -271,8 +301,10 @@ public final class AlarmStore {
                 }
                 if(!src.getBoolean("enabled")) {
                     if(old!=null) {
-                        if(protectPhoneOccurrence(old,now)) { old.put("_phoneRetired",true); pending=true; }
-                        else { rows.remove(index(rows,old.getLong("id"))); obsolete.add(old); fallbackCount--; }
+                        if(protectRemovedPhoneOccurrence(old,now)) {
+                            retirePhoneFuture(old,now,obsolete);
+                            old.put("_phoneRetired",true); pending=true;
+                        } else { rows.remove(index(rows,old.getLong("id"))); obsolete.add(old); fallbackCount--; }
                     }
                     continue;
                 }
@@ -280,7 +312,7 @@ public final class AlarmStore {
                 if(target==0&&snooze>0&&snooze>now-RING_TIMEOUT) target=snooze;
                 boolean oneShot=src.getJSONArray("days").length()==0;
                 String activeToken="", sourceOccurrence=src.optString("_sourceOccurrenceId",""); long activeExpires=0;
-                String consumed=old==null?"":old.optString("_phoneConsumedOccurrenceId","");
+                String consumed=old==null?legacyConsumed(rows,node,epoch,phoneId):old.optString("_phoneConsumedOccurrenceId","");
                 boolean suppressPending=(occurrenceId(dismissed)&&dismissed.equals(sourceOccurrence))||
                         (occurrenceId(consumed)&&consumed.equals(sourceOccurrence));
                 if(suppressPending) {
@@ -398,6 +430,8 @@ public final class AlarmStore {
                             if(transition.has("lastOccurrenceDate")) a.put("_lastOccurrenceDate",transition.getString("lastOccurrenceDate"));
                         }
                     }
+                    boolean countKnown=applyPhoneSnoozeCount(a,active,sourceLineage);
+                    if(!countKnown&&!a.has("_snoozeUsed")&&(snooze>0||!activeToken.isEmpty())) a.put("_phoneSnoozeCountUnknown",true);
                     if(target>0&&(target>now||now-target<RING_TIMEOUT)) {
                         a.put("_token",UUID.randomUUID().toString()).put("_nextAt",target)
                             .put("_scheduledDate",java.time.Instant.ofEpochMilli(target).atZone(ZoneId.systemDefault()).toLocalDate().toString());
@@ -417,7 +451,11 @@ public final class AlarmStore {
                 }
                 if(old==null) { rows.put(a); fallbackCount++; } else { rows.put(index(rows,localId),a); obsolete.add(old); }
             }
-            s.put("_phoneNode",node).put("_phoneEpoch",epoch).put("_phoneRevision",revision).put("_phonePublished",published);
+            JSONArray acceptedRows=new JSONArray();
+            for(JSONObject src:source) acceptedRows.put(publicAlarm(src).put("id",src.getLong("_sourceId")).put("nextTriggerAt",src.getLong("_sourceNext"))
+                .put("snoozedUntil",src.getLong("_sourceSnooze")).put("occurrenceId",src.optString("_sourceOccurrenceId")));
+            s.put("_phoneNode",node).put("_phoneEpoch",epoch).put("_phoneRevision",revision).put("_phonePublished",published)
+                .put("_phoneAccepted",new JSONObject().put("alarms",acceptedRows));
             if(pending) s.put("_phoneDesired",new JSONObject(snapshot.toString())).put("_phoneDesiredNode",node).put("_phoneRetryAt",now+RETRY_DELAY);
             else { s.remove("_phoneDesired"); s.remove("_phoneDesiredNode"); s.remove("_phoneRetryAt"); }
             JSONObject stagedState=state(c); JSONArray staged=stagedState.optJSONArray("_phoneStaged");
@@ -439,6 +477,30 @@ public final class AlarmStore {
     }
     // Legacy locally snoozed generations lack an explicit marker, but their
     // persisted snooze count distinguishes them from an original local fire.
+    private static boolean applyPhoneSnoozeCount(JSONObject a,JSONArray active,JSONArray lineage) throws Exception {
+        if(localPhoneSnooze(a)) return false;
+        if(active==null) active=new JSONArray();
+        JSONObject live=a.optJSONObject("_active");
+        String occurrence=live==null?a.optString("_phoneOccurrenceId"):live.optString("occurrenceId");
+        if(!occurrenceId(occurrence)) return false;
+        for(int i=0;i<active.length();i++) {
+            JSONObject phone=active.getJSONObject(i);
+            if(a.optLong("_phoneId")!=phone.optLong("id")||!occurrence.equals(phone.optString("occurrenceId"))||!phone.has("snoozeUsed")) continue;
+            int used=(int)integer(phone,"snoozeUsed",0,0,Integer.MAX_VALUE);
+            if(live==null) a.put("_snoozeUsed",used); else live.put("snoozeUsed",used);
+            if(used>0) a.put("_phoneImportedSnooze",true);
+            a.remove("_phoneSnoozeCountUnknown"); return true;
+        }
+        if(lineage!=null) for(int i=0;i<lineage.length();i++) {
+            JSONObject transition=lineage.getJSONObject(i);
+            if(!occurrence.equals(transition.optString("nextOccurrenceId"))) continue;
+            int used=transition.getInt("snoozeUsed");
+            if(live==null) a.put("_snoozeUsed",used); else live.put("snoozeUsed",used);
+            if(used>0) a.put("_phoneImportedSnooze",true);
+            a.remove("_phoneSnoozeCountUnknown"); return true;
+        }
+        return false;
+    }
     private static boolean localPhoneSnooze(JSONObject old) {
         JSONObject live=old.optJSONObject("_active");
         return old.optBoolean("_phoneLocalSnooze")||(!old.optBoolean("_phoneImportedSnooze")&&
@@ -601,6 +663,15 @@ public final class AlarmStore {
             if(phoneFallbackProblem(c)==null) AlarmNotifications.clearPhoneFallbackWarning(c,true);
         }
     }
+    private static void retirePhoneFuture(JSONObject a,long now,List<JSONObject> obsolete) throws Exception {
+        if(!a.has("_token")||a.optLong("_nextAt")<=now||(localPhoneSnooze(a)&&a.has("_snoozeAt"))) return;
+        obsolete.add(new JSONObject(a.toString()));
+        for(String key:new String[]{"_token","_nextAt","_snoozeAt","_snoozeUsed","_phoneFirstAt","_phoneOccurrenceId","_phoneActiveExpiresAt"}) a.remove(key);
+    }
+    private static boolean protectRemovedPhoneOccurrence(JSONObject a,long now) {
+        long due=a.optLong("_nextAt",0);
+        return a.has("_active")||localPhoneSnooze(a)||(due>0&&due<=now&&now-due<RING_TIMEOUT);
+    }
     private static boolean protectPhoneOccurrence(JSONObject a,long now) {
         long due=a.optLong("_nextAt",0);
         return a.has("_active")||a.has("_snoozeAt")||(due>0&&due<=now&&now-due<RING_TIMEOUT);
@@ -612,11 +683,13 @@ public final class AlarmStore {
             for(int i=0;i<rows.length();i++) { JSONObject a=rows.getJSONObject(i);
                 if(a.optBoolean("_phoneFallback")&&a.has("_error")) return a.optString("_error");
             }
+            if(state.optJSONArray("_phoneStaged")!=null&&state.getJSONArray("_phoneStaged").length()>0) return "Phone fallback token cleanup pending";
             return state.has("_phoneDesired")?"Phone fallback changes pending; retry scheduled":null;
         } catch(Exception e) { return "Phone fallback state unavailable"; }
     }
     // A snapshot and its revision must come from the same synchronized store generation.
     static synchronized JSONObject wearSnapshot(Context c) throws Exception {
+        migrateLegacyWatchSnoozes(c);
         JSONObject s=state(c); JSONArray ringing=new JSONArray(), rows=s.getJSONArray("alarms"), published=alarms(c);
         long now=System.currentTimeMillis();
         for(int i=0;i<published.length();i++) {
@@ -639,13 +712,17 @@ public final class AlarmStore {
                     .put("hour",alarm.getInt("hour")).put("minute",alarm.getInt("minute"))
                     .put("label",alarm.optString("label","")).put("sound",requestsSound(alarm))
                     .put("vibrate",alarm.optBoolean("vibrate")).put("canSnooze",canSnooze(alarm));
+                for(String k:new String[]{"snoozeEnabled","snoozeMinutes","snoozeCount","vibrationPattern"})
+                    if(alarm.has(k)) item.put(k,alarm.get(k));
+                item.put("snoozeUsed",session.optInt("snoozeUsed",0));
                 String occurrence=session.optString("occurrenceId","");
                 if(occurrenceId(occurrence)) item.put("occurrenceId",occurrence);
                 ringing.put(item);
             }
         }
-        return new JSONObject().put("revision",s.optLong("_wearRevision",0))
-            .put("updatedAt",now).put("alarms",published).put("groups",groups(c)).put("active",ringing);
+        return new JSONObject().put("snoozeProtocol",2).put("revision",s.optLong("_wearRevision",0))
+            .put("updatedAt",now).put("alarms",published).put("groups",groups(c)).put("active",ringing)
+            .put("phoneFallbacks",phoneFallbackAlarms(c)).put("watchSnoozeRequests",watchSnoozeRequests(c));
     }
     static synchronized void wearSetEnabled(Context c,long revision,long id,boolean enabled,long expiresAt) throws Exception {
         if(System.currentTimeMillis()>expiresAt) throw new IllegalArgumentException("Request expired; refresh on watch");
@@ -654,6 +731,59 @@ public final class AlarmStore {
         JSONObject a=find(s.getJSONArray("alarms"),id);
         if(a==null) throw new IllegalArgumentException("Alarm no longer exists; refresh on watch");
         if(a.optBoolean("enabled")!=enabled) saveAlarm(c,new JSONObject().put("id",id).put("enabled",enabled));
+    }
+    static synchronized JSONObject wearSnoozeReceipt(Context c,String node,JSONObject request) throws Exception {
+        SnoozeProtocol.validate(request);
+        JSONArray receipts=state(c).optJSONArray("_wearSnoozes");
+        if(receipts!=null) for(int i=0;i<receipts.length();i++) {
+            JSONObject r=receipts.getJSONObject(i);
+            if(node.equals(r.optString("node"))&&request.getString("requestId").equals(r.optString("requestId"))) {
+                if(!SnoozeProtocol.same(request,r)) throw new IllegalArgumentException("Request ID reused");
+                return new JSONObject(r.toString());
+            }
+        }
+        return null;
+    }
+    static final class WearSnoozeRejectedException extends IllegalArgumentException {
+        WearSnoozeRejectedException(String reason) { super(reason); }
+    }
+    /** Reclaim expired admissions, never an in-flight write. Persist the replay floor
+     * with the next mutation so wall-clock rollback cannot re-admit forgotten writes. */
+    private static void compactWearSnoozes(JSONObject s,long now) throws Exception {
+        JSONArray receipts=s.optJSONArray("_wearSnoozes"); if(receipts==null) return;
+        long floor=s.optLong("_wearSnoozeClosedThrough",0);
+        for(int i=receipts.length()-1;i>=0;i--) {
+            long issued=receipts.getJSONObject(i).optLong("issuedAt",Long.MAX_VALUE);
+            if(issued>0&&issued<=now-SnoozeProtocol.LOOKUP_RETENTION) {
+                floor=Math.max(floor,issued); receipts.remove(i);
+            }
+        }
+        while(receipts.length()>=SnoozeProtocol.CAPACITY) {
+            int oldest=-1; long issued=Long.MAX_VALUE;
+            for(int i=0;i<receipts.length();i++) {
+                long candidate=receipts.getJSONObject(i).optLong("issuedAt",Long.MAX_VALUE);
+                if(candidate>0&&candidate<=now-SnoozeProtocol.WINDOW&&candidate<issued) { oldest=i; issued=candidate; }
+            }
+            if(oldest<0) break; // Real concurrent/uncertain capacity still fails closed.
+            floor=Math.max(floor,issued); receipts.remove(oldest);
+        }
+        if(floor>0) s.put("_wearSnoozeClosedThrough",floor);
+    }
+    static synchronized JSONObject wearSnooze(Context c,String node,JSONObject request) throws Exception {
+        JSONObject prior=wearSnoozeReceipt(c,node,request); if(prior!=null) return prior;
+        long now=System.currentTimeMillis(), issued=request.getLong("issuedAt");
+        if(issued>now+5_000||now>=issued+SnoozeProtocol.WINDOW) throw new WearSnoozeRejectedException("Request expired");
+        JSONObject s=state(c); compactWearSnoozes(s,now);
+        if(issued<=s.optLong("_wearSnoozeClosedThrough",0)) throw new WearSnoozeRejectedException("Request retired");
+        JSONArray receipts=s.optJSONArray("_wearSnoozes");
+        if(receipts!=null&&receipts.length()>=SnoozeProtocol.CAPACITY) throw new WearReceiptCapacityException();
+        JSONObject a=active(c,request.getLong("id"),request.getString("token"));
+        if(a==null||!request.getString("occurrenceId").equals(a.getJSONObject("_active").optString("occurrenceId")))
+            throw new WearSnoozeRejectedException("Exact phone session unavailable");
+        if(!canSnooze(a)) throw new WearSnoozeRejectedException("Snooze limit reached");
+        JSONObject receipt=new JSONObject(request.toString()).put("node",node);
+        finish(c,request.getLong("id"),request.getString("token"),true,request.getInt("minutes"),true,receipt);
+        return wearSnoozeReceipt(c,node,request);
     }
     static synchronized void wearFinish(Context c,long id,String token,boolean snooze,long expiresAt) throws Exception {
         if(System.currentTimeMillis()>expiresAt||token==null)
@@ -1147,8 +1277,8 @@ public final class AlarmStore {
         int count=a.optInt("_snoozeUsed",0);
         // A later ordinary weekly occurrence is independent of an earlier local
         // or imported snooze; do not carry its conflict marker forward.
-        if(a.optBoolean("_phoneFallback")&&!a.has("_snoozeAt")) {
-            a.remove("_phoneLocalSnooze"); a.remove("_phoneImportedSnooze");
+        if(a.optBoolean("_phoneFallback")&&!a.has("_snoozeAt")&&!a.has("_phoneFirstAt")) {
+            a.remove("_phoneLocalSnooze"); a.remove("_phoneImportedSnooze"); a.remove("_phoneSnoozeCountUnknown");
         }
         if(a.getJSONArray("days").length()>0&&!a.has("_snoozeAt"))
             a.put("_lastOccurrenceDate",a.optString("_scheduledDate",java.time.Instant.ofEpochMilli(a.optLong("_nextAt")).atZone(ZoneId.systemDefault()).toLocalDate().toString()));
@@ -1212,7 +1342,7 @@ public final class AlarmStore {
     }
     static boolean canSnooze(JSONObject a) {
         JSONObject active=a.optJSONObject("_active");
-        return active!=null&&a.optBoolean("snoozeEnabled")&&(a.optInt("snoozeCount")==0||active.optInt("snoozeUsed")<a.optInt("snoozeCount"));
+        return active!=null&&!a.optBoolean("_phoneSnoozeCountUnknown")&&a.optBoolean("snoozeEnabled")&&(a.optInt("snoozeCount")==0||active.optInt("snoozeUsed")<a.optInt("snoozeCount"));
     }
     static synchronized void finish(Context c,long id,String token,boolean snooze) throws Exception {
         finish(c,id,token,snooze,null);
@@ -1222,6 +1352,9 @@ public final class AlarmStore {
         finish(c,id,token,snooze,minutesOverride,false);
     }
     private static void finish(Context c,long id,String token,boolean snooze,Integer minutesOverride,boolean validatedMirror) throws Exception {
+        finish(c,id,token,snooze,minutesOverride,validatedMirror,null);
+    }
+    private static void finish(Context c,long id,String token,boolean snooze,Integer minutesOverride,boolean validatedMirror,JSONObject receipt) throws Exception {
         JSONObject s=state(c); JSONObject a=find(s.getJSONArray("alarms"),id);
         if(a==null||!a.has("_active")||!token.equals(a.getJSONObject("_active").optString("token"))) return;
         JSONObject old=new JSONObject(a.toString());
@@ -1280,7 +1413,23 @@ public final class AlarmStore {
             } catch(Exception failure) { cancel(c,a); throw failure; }
         } else if(a.getJSONArray("days").length()==0||a.optBoolean("_phoneRetired")) a.put("enabled",false);
         a.remove("_active");
-        try { commit(c,s); } catch(Exception e) { if(snooze) cancel(c,a); throw e; }
+        long expires=0, deadline=0;
+        try {
+            if(receipt!=null) {
+                compactWearSnoozes(s,System.currentTimeMillis());
+                if(receipt.getLong("issuedAt")<=s.optLong("_wearSnoozeClosedThrough",0))
+                    throw new WearSnoozeRejectedException("Request retired");
+                JSONArray receipts=s.optJSONArray("_wearSnoozes");
+                if(receipts==null) { receipts=new JSONArray(); s.put("_wearSnoozes",receipts); }
+                if(receipts.length()>=SnoozeProtocol.CAPACITY) throw new WearReceiptCapacityException();
+                receipt.put("nextOccurrenceId",a.getString("_token")).put("snoozeAt",a.getLong("_snoozeAt"))
+                    .put("snoozeUsed",a.getInt("_snoozeUsed")).put("revision",s.optLong("_wearRevision",0)+1);
+                receipts.put(receipt);
+                expires=receipt.getLong("issuedAt")+SnoozeProtocol.WINDOW;
+                deadline=android.os.SystemClock.elapsedRealtime()+Math.max(0,expires-System.currentTimeMillis());
+            }
+            commit(c,s,expires,deadline);
+        } catch(Exception e) { if(snooze) cancel(c,a); throw e; }
         if(outboxFull) {
             android.util.Log.w("OpenClock","Phone dismissal outbox full; dismissed locally only, phone sync failed");
             try { AlarmNotifications.warning(c,"Dismissed on watch only; phone dismissal could not be queued."); }
@@ -1437,6 +1586,12 @@ public final class AlarmStore {
             JSONObject marker=markers.optJSONObject(i);
             if(marker!=null) keys.add(marker.optLong("id")+":"+marker.optString("token"));
         }
+        JSONArray snoozes=state(c).optJSONArray("_watchSnoozes");
+        if(snoozes!=null) for(int i=0;i<snoozes.length();i++) {
+            JSONObject r=snoozes.optJSONObject(i);
+            if(r!=null&&("branched".equals(r.optString("state"))||"confirmed".equals(r.optString("state"))))
+                keys.add(r.optLong("phoneId")+":"+r.optString("phoneToken"));
+        }
         return keys;
     }
     // A fallback dismissal can commit before its mirror preference tombstone.
@@ -1445,6 +1600,9 @@ public final class AlarmStore {
         Set<String> keys=new HashSet<>(); JSONArray rows=state(c).optJSONArray("alarms");
         if(rows!=null) for(int i=0;i<rows.length();i++) {
             JSONObject row=rows.optJSONObject(i);
+            JSONObject legacy=row==null?null:row.optJSONObject("_watchLegacyOrigin");
+            if(legacy!=null&&node.equals(legacy.optString("node"))&&epoch.equals(legacy.optString("epoch"))&&occurrenceId(legacy.optString("occurrenceId")))
+                keys.add(legacy.optLong("id")+":"+legacy.optString("occurrenceId"));
             if(row==null||!row.optBoolean("_phoneFallback")||!node.equals(row.optString("_phoneNode"))||
                     !epoch.equals(row.optString("_phoneEpoch"))) continue;
             long id=row.optLong("_phoneId"); String occurrence=row.optString("_phoneConsumedOccurrenceId");
@@ -1732,6 +1890,9 @@ public final class AlarmStore {
         long phoneRetry=s.optLong("_phoneRetryAt",0);
         if(s.has("_phoneDesired")&&phoneRetry>0)
             at=Math.min(at,phoneRetry<=now?now+RETRY_DELAY:Math.max(now+1000,phoneRetry));
+        JSONArray requests=s.optJSONArray("_watchSnoozes");
+        if(requests!=null) for(int i=0;i<requests.length();i++)
+            if("pending".equals(requests.getJSONObject(i).optString("state"))) at=Math.min(at,now+30_000);
         JSONArray as=s.getJSONArray("alarms");
         for(int i=0;i<as.length();i++) {
             JSONObject a=as.getJSONObject(i), session=a.optJSONObject("_active");
@@ -1796,6 +1957,7 @@ public final class AlarmStore {
         } catch(Exception e) { AlarmNotifications.warning(c,message(e)); }
     }
     static synchronized void recoverRinging(Context c) {
+        WearSync.recoverSnoozes(c);
         try {
             expireSessions(c);
             try { armRecovery(c,state(c)); } catch(Exception unavailable) { AlarmNotifications.warning(c,message(unavailable)); }
@@ -1813,6 +1975,323 @@ public final class AlarmStore {
     static void refreshService(Context c) {
         // Only a running service receives this private, in-process invalidation.
         Intent i=new Intent("com.openclock.REFRESH").setPackage(c.getPackageName()); c.sendBroadcast(i);
+    }
+    /** Preserve legacy local pending snoozes as visible one-shots, retaining their token. */
+    private static void migrateLegacyWatchSnoozes(Context c) throws Exception {
+        JSONObject s=state(c); JSONArray rows=s.getJSONArray("alarms"); boolean changed=false;
+        for(int i=0;i<rows.length();i++) {
+            JSONObject a=rows.getJSONObject(i);
+            if(!a.optBoolean("_phoneFallback")||a.has("_active")||!a.has("_token")||!a.has("_snoozeAt")||!localPhoneSnooze(a)) continue;
+            long at=a.getLong("_snoozeAt");
+            // Unknown old records with no marker/import provenance remain protected and visible.
+            if(!a.optBoolean("_phoneLocalSnooze")) {
+                if(!"Ambiguous legacy snooze ownership; retained".equals(a.optString("_error"))) { a.put("_error","Ambiguous legacy snooze ownership; retained"); changed=true; }
+                continue;
+            }
+            if(occurrenceId(a.optString("_phoneOccurrenceId"))) a.put("_watchLegacyOrigin",new JSONObject()
+                .put("node",a.optString("_phoneNode")).put("epoch",a.optString("_phoneEpoch")).put("id",a.optLong("_phoneId"))
+                .put("occurrenceId",a.getString("_phoneOccurrenceId")));
+            List<String> remove=new ArrayList<>(); Iterator<String> keys=a.keys();
+            while(keys.hasNext()) { String k=keys.next(); if(k.startsWith("_phone")) remove.add(k); }
+            for(String k:remove) a.remove(k);
+            java.time.ZonedDateTime date=java.time.Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault());
+            a.put("days",new JSONArray()).put("date",date.toLocalDate().toString()).put("hour",date.getHour()).put("minute",date.getMinute())
+                .put("_watchOnlySnooze",true); changed=true;
+        }
+        if(changed) commit(c,s);
+    }
+    private static String legacyConsumed(JSONArray rows,String node,String epoch,long id) throws Exception {
+        String found="";
+        for(int i=0;i<rows.length();i++) {
+            JSONObject origin=rows.getJSONObject(i).optJSONObject("_watchLegacyOrigin");
+            if(origin==null||!node.equals(origin.optString("node"))||!epoch.equals(origin.optString("epoch"))||id!=origin.optLong("id")) continue;
+            String occurrence=origin.optString("occurrenceId"); if(!occurrenceId(occurrence)) continue;
+            if(!found.isEmpty()&&!found.equals(occurrence)) return "";
+            found=occurrence;
+        }
+        return found;
+    }
+    static synchronized JSONObject mirrorSnoozeTemplate(Context c,JSONObject identity,JSONObject mirror) throws Exception {
+        if(identity==null||!SnoozeProtocol.uuid(identity.optString("occurrenceId"))) return null;
+        JSONArray rows=state(c).getJSONArray("alarms"); JSONObject found=null;
+        for(int i=0;i<rows.length();i++) {
+            JSONObject row=rows.getJSONObject(i), active=row.optJSONObject("_active");
+            String occurrence=active==null?row.optString("_phoneOccurrenceId"):active.optString("occurrenceId");
+            if(!row.optBoolean("_phoneFallback")||!identity.optString("node").equals(row.optString("_phoneNode"))
+                ||!identity.optString("epoch").equals(row.optString("_phoneEpoch"))||identity.optLong("id")!=row.optLong("_phoneId")
+                ||!identity.getString("occurrenceId").equals(occurrence)) continue;
+            if(found!=null||row.optBoolean("_phoneSnoozeCountUnknown")) return null;
+            if(active==null&&row.optBoolean("_phoneImportedSnooze")&&!row.has("_snoozeUsed")) return null;
+            found=new JSONObject(mirror.toString());
+            for(String key:new String[]{"label","sound","vibrate","vibrationPattern","snoozeEnabled","snoozeMinutes","snoozeCount"})
+                if(row.has(key)) found.put(key,row.get(key));
+            found.put("snoozeUsed",active==null?row.optInt("_snoozeUsed"):active.optInt("snoozeUsed"));
+        }
+        return found;
+    }
+    /** Retain uncertain intents and unapplied receipts. Resolved history is not a
+     * lifetime quota; keep only the per-fallback proof still needed by lineage. */
+    private static void compactWatchSnoozes(JSONObject s,long now) throws Exception {
+        JSONArray requests=s.optJSONArray("_watchSnoozes"); if(requests==null) return;
+        JSONArray rows=s.getJSONArray("alarms");
+        long floor=s.optLong("_watchSnoozeClosedThrough",0);
+        for(int i=requests.length()-1;i>=0;i--) {
+            JSONObject r=requests.getJSONObject(i); String status=r.optString("state");
+            if(!"confirmed".equals(status)&&!"superseded".equals(status)&&!"expired".equals(status)&&!"branched".equals(status)) continue;
+            long created=r.optLong("createdAt",Long.MAX_VALUE);
+            if(created<=0||created>now-RING_TIMEOUT-60_000) continue;
+            JSONObject template=r.optJSONObject("template");
+            long sourceEnd=Math.max(created+RING_TIMEOUT+60_000,template==null?0:template.optLong("expiresAt"));
+            if(sourceEnd>now) continue;
+            JSONObject source=find(rows,r.optLong("localId"));
+            JSONObject active=source==null?null:source.optJSONObject("_active");
+            if(active!=null&&r.optString("localToken").equals(active.optString("token"))) continue;
+            if("branched".equals(status)&&r.has("request")&&!r.has("receipt")) {
+                // Preserve status lookup/correlation throughout the uncertainty window,
+                // and as long as an independent branch still has a live generation.
+                JSONObject branch=find(rows,r.optLong("branchId"));
+                if(created>now-SnoozeProtocol.LOOKUP_RETENTION||
+                    (branch!=null&&(branch.has("_active")||branch.has("_token")||branch.has("_retryAt")))) continue;
+            }
+            JSONObject receipt=r.optJSONObject("receipt");
+            if(receipt!=null) for(int j=0;j<rows.length();j++) {
+                JSONObject row=rows.getJSONObject(j);
+                if(row.optBoolean("_phoneFallback")&&r.optString("node").equals(row.optString("_phoneNode"))
+                    &&r.optString("epoch").equals(row.optString("_phoneEpoch"))&&r.optLong("phoneId")==row.optLong("_phoneId")
+                    &&r.optString("occurrenceId").equals(row.optString("_phoneConsumedOccurrenceId")))
+                    row.put("_phoneSnoozeReceipt",new JSONObject(receipt.toString()));
+            }
+            floor=Math.max(floor,sourceEnd); requests.remove(i);
+        }
+        if(floor>0) s.put("_watchSnoozeClosedThrough",floor);
+    }
+    /** Durable intent BEFORE any network dispatch; requests are never replayed as writes. */
+    static synchronized JSONObject beginWatchSnooze(Context c,JSONObject template,long localId,String token,JSONObject identity,int minutes) throws Exception {
+        if(minutes<1||minutes>1440) throw new IllegalArgumentException("Invalid snooze interval");
+        JSONObject s=state(c); compactWatchSnoozes(s,System.currentTimeMillis());
+        JSONArray requests=s.optJSONArray("_watchSnoozes");
+        if(requests==null) { requests=new JSONArray(); s.put("_watchSnoozes",requests); }
+        for(int i=0;i<requests.length();i++) {
+            JSONObject r=requests.getJSONObject(i);
+            if("superseded".equals(r.optString("state"))) continue;
+            if(localId==r.optLong("localId")&&token.equals(r.optString("localToken"))) return new JSONObject(r.toString());
+            if(identity!=null&&SnoozeProtocol.uuid(identity.optString("occurrenceId"))&&identity.optString("node").equals(r.optString("node"))&&identity.optString("epoch").equals(r.optString("epoch"))
+                &&identity.optLong("id")==r.optLong("phoneId")&&identity.optString("occurrenceId").equals(r.optString("occurrenceId"))) return new JSONObject(r.toString());
+        }
+        if(requests.length()>=SnoozeProtocol.CAPACITY) throw new IllegalStateException("Watch snooze receipt capacity reached; original alarm retained");
+        if(localId>0) {
+            JSONObject live=active(c,localId,token);
+            if(live==null||!canSnooze(live)) throw new IllegalArgumentException("Snooze unavailable");
+            template=live;
+        } else if(template.optLong("expiresAt",0)<=Math.max(System.currentTimeMillis(),s.optLong("_watchSnoozeClosedThrough",0)))
+            throw new IllegalArgumentException("Phone occurrence expired");
+        else if(!template.optBoolean("canSnooze")||!template.has("snoozeUsed")||!template.has("snoozeCount"))
+            throw new IllegalArgumentException("Phone snooze limits unavailable; original alarm retained");
+        JSONObject session=template.optJSONObject("_active");
+        int used=session==null?template.getInt("snoozeUsed"):session.optInt("snoozeUsed");
+        int limit=template.getInt("snoozeCount");
+        if(!template.optBoolean("snoozeEnabled")||used<0||(limit>0&&used>=limit)) throw new IllegalArgumentException("Snooze limit reached");
+        JSONObject r=new JSONObject().put("requestId",UUID.randomUUID().toString()).put("localId",localId).put("localToken",token)
+            .put("template",new JSONObject(template.toString())).put("minutes",minutes).put("used",used)
+            .put("createdAt",System.currentTimeMillis()).put("state","pending");
+        if(identity!=null) {
+            for(String k:new String[]{"node","epoch","occurrenceId"}) r.put(k,identity.get(k));
+            r.put("phoneId",identity.getLong("id")).put("phoneToken",identity.optString("mirrorToken",identity.optString("token")));
+            JSONObject request=new JSONObject().put("version",2).put("requestId",r.getString("requestId"))
+                .put("owner",identity.getString("node")).put("epoch",identity.getString("epoch"))
+                .put("id",identity.getLong("id")).put("token",identity.getString("token"))
+                .put("occurrenceId",identity.getString("occurrenceId")).put("minutes",minutes).put("issuedAt",r.getLong("createdAt"));
+            if(SnoozeProtocol.uuid(identity.optString("token"))&&SnoozeProtocol.uuid(identity.optString("occurrenceId"))) {
+                SnoozeProtocol.validate(request); r.put("request",request);
+            }
+        }
+        requests.put(r); commit(c,s); return new JSONObject(r.toString()).put("fresh",true);
+    }
+    static synchronized JSONArray watchSnoozeRequests(Context c) throws Exception {
+        JSONArray a=state(c).optJSONArray("_watchSnoozes"); return a==null?new JSONArray():new JSONArray(a.toString());
+    }
+    private static JSONObject watchRequest(JSONObject s,String id) throws Exception {
+        JSONArray a=s.optJSONArray("_watchSnoozes");
+        if(a!=null) for(int i=0;i<a.length();i++) if(id.equals(a.getJSONObject(i).optString("requestId"))) return a.getJSONObject(i);
+        throw new IllegalArgumentException("Unknown watch snooze");
+    }
+    /** Close only this exact local session/occurrence. No generic phone dismissal. */
+    private static List<JSONObject> closeWatchSnoozeSource(JSONObject s,JSONObject r) throws Exception {
+        List<JSONObject> obsolete=new ArrayList<>(); JSONArray rows=s.getJSONArray("alarms");
+        for(int i=0;i<rows.length();i++) {
+            JSONObject a=rows.getJSONObject(i), live=a.optJSONObject("_active");
+            boolean anchor=a.optLong("id")==r.optLong("localId")&&live!=null&&r.getString("localToken").equals(live.optString("token"));
+            boolean owner=a.optBoolean("_phoneFallback")&&r.optString("node").equals(a.optString("_phoneNode"))
+                &&r.optString("epoch").equals(a.optString("_phoneEpoch"))&&r.optLong("phoneId")==a.optLong("_phoneId");
+            String occurrence=r.optString("occurrenceId","");
+            boolean linked=owner&&SnoozeProtocol.uuid(occurrence)&&live!=null&&occurrence.equals(live.optString("occurrenceId"));
+            boolean queued=owner&&SnoozeProtocol.uuid(occurrence)&&occurrence.equals(a.optString("_phoneOccurrenceId"))
+                &&a.has("_token")&&a.optLong("_nextAt")<=System.currentTimeMillis();
+            if(!anchor&&!linked&&!queued) continue;
+            if(anchor||linked) a.remove("_active");
+            if(queued) {
+                obsolete.add(new JSONObject(a.toString()));
+                JSONArray staged=s.optJSONArray("_phoneStaged");
+                if(staged==null) { staged=new JSONArray(); s.put("_phoneStaged",staged); }
+                staged.put(new JSONObject().put("id",a.getLong("id")).put("_token",a.getString("_token")));
+                for(String k:new String[]{"_token","_nextAt","_snoozeAt","_snoozeUsed","_phoneFirstAt","_phoneOccurrenceId","_phoneActiveExpiresAt"}) a.remove(k);
+                if(a.getJSONArray("days").length()>0&&!a.optBoolean("_phoneRetired")) {
+                    if(a.has("_scheduledDate")) a.put("_lastOccurrenceDate",a.getString("_scheduledDate"));
+                    a.put("_retryAt",System.currentTimeMillis()+1000);
+                }
+            }
+            if(a.optBoolean("_phoneFallback")&&SnoozeProtocol.uuid(occurrence)) a.put("_phoneConsumedOccurrenceId",occurrence);
+            if(a.getJSONArray("days").length()==0||a.optBoolean("_phoneRetired")) a.put("enabled",false);
+        }
+        return obsolete;
+    }
+    static synchronized JSONObject completeWatchSnooze(Context c,String requestId,JSONObject receipt,boolean mirrorStillActive) throws Exception {
+        JSONObject s=state(c), r=watchRequest(s,requestId); String prior=r.getString("state");
+        if(receipt!=null) {
+            JSONObject request=r.optJSONObject("request");
+            if(request==null||!SnoozeProtocol.same(request,receipt)||!SnoozeProtocol.uuid(receipt.optString("nextOccurrenceId"))
+                ||request.getString("occurrenceId").equals(receipt.optString("nextOccurrenceId"))
+                ||SnoozeProtocol.integer(receipt,"snoozeAt")<=0||SnoozeProtocol.integer(receipt,"revision")<0
+                ||SnoozeProtocol.integer(receipt,"snoozeUsed")<1||SnoozeProtocol.integer(receipt,"snoozeUsed")>Integer.MAX_VALUE)
+                throw new IllegalArgumentException("Invalid snooze receipt");
+            r.put("receipt",new JSONObject(receipt.toString()));
+            // A late positive receipt never deletes or changes the independent watch branch.
+            if("branched".equals(prior)||"confirmed".equals(prior)) { commit(c,s); return new JSONObject(r.toString()); }
+            if(!r.optString("node").equals(s.optString("_phoneNode"))||!r.optString("epoch").equals(s.optString("_phoneEpoch"))) {
+                // A retired publisher's receipt cannot restore its phone-owned schedule.
+                // Preserve the user's pending snooze as an independent branch instead.
+                commit(c,s); return completeWatchSnooze(c,requestId,null,mirrorStillActive);
+            }
+            JSONObject accepted=s.optJSONObject("_phoneAccepted");
+            if(accepted!=null&&s.optLong("_phoneRevision",-1)>=receipt.getLong("revision")) {
+                JSONObject authoritative=find(accepted.getJSONArray("alarms"),r.getLong("phoneId"));
+                boolean current=authoritative!=null&&authoritative.optBoolean("enabled")
+                    &&receipt.getString("nextOccurrenceId").equals(authoritative.optString("occurrenceId"))
+                    &&receipt.getLong("snoozeAt")==authoritative.optLong("snoozedUntil");
+                if(!current) {
+                    // A later deletion/edit/active generation supersedes this old receipt.
+                    r.put("state","superseded"); commit(c,s); return new JSONObject(r.toString());
+                }
+            }
+            JSONArray rows=s.getJSONArray("alarms"); JSONObject old=null;
+            for(int i=0;i<rows.length();i++) {
+                JSONObject candidate=rows.getJSONObject(i);
+                if(candidate.optBoolean("_phoneFallback")&&r.optString("node").equals(candidate.optString("_phoneNode"))
+                    &&r.optString("epoch").equals(candidate.optString("_phoneEpoch"))&&r.optLong("phoneId")==candidate.optLong("_phoneId")) {
+                    if(old!=null) throw new IllegalStateException("Ambiguous fallback identity"); old=candidate;
+                }
+            }
+            JSONObject live=old==null?null:old.optJSONObject("_active");
+            if(old!=null&&old.optBoolean("_phoneImportedSnooze")&&receipt.getString("nextOccurrenceId").equals(old.optString("_phoneOccurrenceId"))
+                &&old.has("_token")&&old.optLong("_snoozeAt")==receipt.getLong("snoozeAt")) {
+                r.put("state","confirmed"); commit(c,s); return new JSONObject(r.toString());
+            }
+            boolean cancelled=old!=null&&r.getString("localToken").equals(old.optString("_lastDismissedSessionToken"));
+            JSONArray dismissed=s.optJSONArray("_mirrorDismissals");
+            if(dismissed!=null) for(int i=0;i<dismissed.length();i++) {
+                JSONObject marker=dismissed.getJSONObject(i);
+                if(r.optLong("phoneId")==marker.optLong("id")&&r.optString("phoneToken").equals(marker.optString("token"))) cancelled=true;
+            }
+            if(cancelled||(live!=null&&!r.optString("occurrenceId").equals(live.optString("occurrenceId")))) {
+                r.put("state","superseded"); commit(c,s); return new JSONObject(r.toString());
+            }
+            if(receipt.getLong("snoozeAt")<=System.currentTimeMillis()-RING_TIMEOUT) {
+                r.put("state","superseded"); commit(c,s); return new JSONObject(r.toString());
+            }
+            JSONObject replacement;
+            if(old==null) {
+                int fallbackCount=0; for(int i=0;i<rows.length();i++) if(rows.getJSONObject(i).optBoolean("_phoneFallback")) fallbackCount++;
+                if(rows.length()>=500||fallbackCount>=350) {
+                    r.put("fallbackError","Fallback capacity reached; original mirror retained"); commit(c,s); return new JSONObject(r.toString());
+                }
+                JSONObject phoneAlarm=accepted==null?null:find(accepted.getJSONArray("alarms"),r.getLong("phoneId"));
+                JSONObject input=new JSONObject((phoneAlarm==null?r.getJSONObject("template"):phoneAlarm).toString()); input.remove("groupId");
+                input.put("enabled",true);
+                replacement=canonical(input,null,s.getLong("nextId"),s.getJSONArray("groups"));
+                s.put("nextId",s.getLong("nextId")+1);
+            } else replacement=new JSONObject(old.toString());
+            // These describe the imported ORIGINAL ring, not the receipt's new generation.
+            replacement.remove("_phoneActiveExpiresAt"); replacement.remove("_phoneActiveToken"); replacement.remove("_phoneFirstAt");
+            replacement.put("_phoneSnoozeReceipt",new JSONObject(receipt.toString()));
+            replacement.remove("_active"); replacement.remove("_phoneLocalSnooze"); replacement.remove("_phoneRetired"); replacement.remove("_phoneSnoozeCountUnknown");
+            String signature=replacement.getInt("hour")+":"+replacement.getInt("minute")+":"+replacement.optString("date")+":"+replacement.getJSONArray("days").toString();
+            if(replacement.getJSONArray("days").length()==0) signature+=":"+receipt.getLong("snoozeAt");
+            replacement.put("_phoneSignature",signature);
+            replacement.put("enabled",true).put("_phoneFallback",true).put("_phoneNode",r.getString("node"))
+                .put("_phoneEpoch",r.getString("epoch")).put("_phoneId",r.getLong("phoneId"))
+                .put("_phoneConsumedOccurrenceId",r.getString("occurrenceId")).put("_phoneImportedSnooze",true)
+                .put("_phoneOccurrenceId",receipt.getString("nextOccurrenceId")).put("_snoozeAt",receipt.getLong("snoozeAt"))
+                .put("_phoneSourceSnooze",receipt.getLong("snoozeAt")).put("_snoozeUsed",receipt.getInt("snoozeUsed"));
+            try {
+                requireAccess(c); prepare(c,replacement,System.currentTimeMillis(),true);
+            } catch(Exception failure) {
+                // The receipt is durable, but a failed registration must keep the original ring.
+                JSONObject stagedState=state(c);
+                if(stagedState.has("_phoneStaged")) s.put("_phoneStaged",stagedState.getJSONArray("_phoneStaged"));
+                s.put("_wearRevision",stagedState.optLong("_wearRevision",0));
+                r.put("fallbackError",message(failure)); commit(c,s); return new JSONObject(r.toString());
+            }
+            try {
+                JSONObject stagedState=state(c); JSONArray staged=stagedState.optJSONArray("_phoneStaged");
+                if(staged==null) staged=new JSONArray();
+                if(old!=null&&old.has("_token")) staged.put(new JSONObject().put("id",old.getLong("id")).put("_token",old.getString("_token")));
+                s.put("_phoneStaged",staged).put("_wearRevision",stagedState.optLong("_wearRevision",0));
+                if(old==null) rows.put(replacement); else rows.put(index(rows,old.getLong("id")),replacement);
+                r.put("state","confirmed"); r.remove("fallbackError"); commit(c,s);
+            } catch(Exception failure) { cancel(c,replacement); throw failure; }
+            if(old!=null) cancel(c,old);
+            try { cleanupPhoneStaged(c); } catch(Exception failure) { AlarmNotifications.warning(c,"Snooze committed; obsolete token cleanup pending"); }
+            return new JSONObject(r.toString());
+        }
+        if(!"pending".equals(prior)) return new JSONObject(r.toString());
+        long localId=r.getLong("localId"); boolean mirrorDismissed=false;
+        JSONArray markers=s.optJSONArray("_mirrorDismissals");
+        if(markers!=null) for(int i=0;i<markers.length();i++) {
+            JSONObject marker=markers.getJSONObject(i);
+            if(r.optLong("phoneId")==marker.optLong("id")&&r.getString("localToken").equals(marker.optString("token"))) mirrorDismissed=true;
+        }
+        JSONObject source=find(s.getJSONArray("alarms"),localId);
+        boolean explicitlyDismissed=source!=null&&r.getString("localToken").equals(source.optString("_lastDismissedSessionToken"));
+        if(explicitlyDismissed||mirrorDismissed) {
+            r.put("state","superseded"); commit(c,s); return new JSONObject(r.toString());
+        }
+        JSONArray rows=s.getJSONArray("alarms");
+        int enabled=0; for(int i=0;i<rows.length();i++) if(rows.getJSONObject(i).optBoolean("enabled")) enabled++;
+        if(rows.length()>=500||enabled>=450) throw new IllegalStateException("Alarm capacity reached; original alarm retained");
+        JSONObject input=new JSONObject(r.getJSONObject("template").toString());
+        input.remove("groupId"); input.remove("date"); input.put("days",new JSONArray()).put("enabled",true);
+        long id=s.getLong("nextId"), at=r.getLong("createdAt")+r.getInt("minutes")*60_000L;
+        if(at<=System.currentTimeMillis()-RING_TIMEOUT) {
+            r.put("state","expired").put("error","Snooze missed while watch unavailable"); commit(c,s); return new JSONObject(r.toString());
+        }
+        java.time.ZonedDateTime date=java.time.Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault());
+        input.put("hour",date.getHour()).put("minute",date.getMinute()).put("date",date.toLocalDate().toString());
+        JSONObject branch=canonical(input,null,id,s.getJSONArray("groups"));
+        branch.put("_watchOnlySnooze",true).put("_watchSnoozeRequest",requestId).put("_snoozeAt",at).put("_snoozeUsed",r.getInt("used")+1);
+        requireAccess(c); prepare(c,branch,System.currentTimeMillis());
+        try {
+            rows.put(branch); s.put("nextId",id+1);
+            closeWatchSnoozeSource(s,r);
+            r.put("state","branched").put("branchId",id).put("branchAt",at);
+            commit(c,s);
+        } catch(Exception failure) { cancel(c,branch); throw failure; }
+        try { cleanupPhoneStaged(c); } catch(Exception failure) { AlarmNotifications.warning(c,"Snooze committed; obsolete token cleanup pending"); }
+        return new JSONObject(r.toString());
+    }
+    /** Scheduler-backed fallback presentation; never reconstruct schedules from the cache. */
+    static synchronized JSONArray phoneFallbackAlarms(Context c) throws Exception {
+        JSONArray rows=state(c).getJSONArray("alarms"), result=new JSONArray();
+        for(int i=0;i<rows.length();i++) {
+            JSONObject a=rows.getJSONObject(i);
+            if(!a.optBoolean("_phoneFallback")) continue;
+            if(!a.optBoolean("enabled")&&!a.has("_active")&&!a.has("_token")&&!a.has("_error")) continue;
+            JSONObject view=publicAlarm(a).put("phoneId",a.optLong("_phoneId")).put("phoneNode",a.optString("_phoneNode"))
+                .put("phoneEpoch",a.optString("_phoneEpoch")).put("occurrenceId",a.optString("_phoneOccurrenceId"))
+                .put("ringing",a.has("_active")).put("uncertain",a.optBoolean("_phoneRetired")||a.optBoolean("_phoneSnoozeCountUnknown")||a.has("_error"));
+            if(a.has("_active")) view.put("uncertain",true);
+            result.put(view);
+        }
+        return result;
     }
     private AlarmStore() {}
 }

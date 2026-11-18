@@ -190,7 +190,7 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { }
         try {
             JSONObject phone = PhoneSync.complicationSnapshot(this);
-            if (phone != null) selection.rows("phone", phone.getJSONArray("alarms"), phone.getJSONArray("active"), now);
+            WatchSchedule.select(selection,WatchSchedule.read(this,phone),now);
         } catch (Exception ignored) { }
         return selection.firstKey();
     }
@@ -266,7 +266,7 @@ public class MainActivity extends Activity {
             JSONObject creation = PhoneSync.pendingCreate(this), mutation = PhoneSync.pendingMutation(this);
             // Both complete row arrays include snoozedUntil, so pending snooze
             // changes redraw the list without adding revisions or timestamps.
-            return new JSONObject().put("watch", AlarmStore.alarms(this))
+            return new JSONObject().put("fallback",AlarmStore.phoneFallbackAlarms(this)).put("snoozeRequests",AlarmStore.watchSnoozeRequests(this)).put("watch", AlarmStore.alarms(this))
                 .put("ringing", AlarmStore.active(this)).put("mirrors", new JSONArray(PhoneMirror.live(this)))
                 .put("alarms", cache.optJSONArray("alarms")).put("groups", cache.optJSONArray("groups"))
                 .put("connected", connected(cache)).put("fresh", updated > 0 && age >= 0 && age <= FRESH_MS)
@@ -347,6 +347,20 @@ public class MainActivity extends Activity {
         activeControls();
         permissions();
         section("Watch alarms");
+        try {
+            JSONArray snoozes=AlarmStore.watchSnoozeRequests(this);
+            for(int i=0;i<snoozes.length();i++) {
+                JSONObject request=snoozes.getJSONObject(i);
+                if("expired".equals(request.optString("state"))) note("Snooze missed while watch unavailable; check both devices.");
+                if("pending".equals(request.optString("state"))) note(request.has("receipt")?
+                    "Phone snooze committed; watch fallback registration pending. Original watch ring retained.":"Phone snooze unconfirmed; watch-only recovery pending.");
+                else if("branched".equals(request.optString("state"))) {
+                    JSONObject branch=AlarmStore.find(AlarmStore.alarms(this),request.optLong("branchId"));
+                    if(branch!=null&&branch.optBoolean("enabled")) note(request.has("receipt")?
+                        "Phone also committed this snooze. Independent watch snooze retained; possible duplicates.":"Watch-only snooze; phone result unknown. Possible duplicates.");
+                }
+            }
+        } catch(Exception unavailable) { note("Snooze ownership state unavailable"); }
         try {
             JSONArray alarms = AlarmStore.alarms(this);
             if (alarms.length() == 0) note("No watch alarms yet");
@@ -666,6 +680,8 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams badge = new LinearLayout.LayoutParams(-2, -2);
             badge.topMargin = dp(4); details.addView(snooze, badge);
         }
+        String ownership=a.optString("ownershipWarning",a.optString("fallbackNotice",""));
+        if(!ownership.isEmpty()) details.addView(text(ownership,11,BLUE,false));
         String error = a.optString("schedulingError", "");
         if (!error.isEmpty() && !"null".equals(error)) { TextView e = text("Not scheduled: " + error, 11, RED, false); details.addView(e); }
         row.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
@@ -868,7 +884,18 @@ public class MainActivity extends Activity {
         else if (updated <= 0 || age < 0 || age > FRESH_MS) note("Phone connected · snapshot is stale or not yet available.");
 
         if (!phoneNotice.isEmpty()) note(phoneNotice);
-        JSONArray alarms = cache.optJSONArray("alarms"), groups = cache.optJSONArray("groups");
+        WatchSchedule.View committed;
+        try { committed=WatchSchedule.read(this,cache); }
+        catch(Exception unavailable) { note("Committed watch fallback state unavailable"); return; }
+        for(int i=0;i<committed.retained.length();i++) {
+            JSONObject row=committed.retained.optJSONObject(i);
+            TextView retained=text("Retained phone fallback (uncertain): "+row.optString("label")+" · "+
+                (row.optBoolean("ringing")?"ringing":row.optLong("nextTriggerAt")>0?
+                    new java.text.SimpleDateFormat("HH:mm · EEE, d MMM",Locale.getDefault()).format(new java.util.Date(row.optLong("nextTriggerAt"))):"check scheduling"),12,BLUE,false);
+            add(retained,8);
+            if(complicationScrollPending&&complicationScrollRow==null&&("fallback:"+row.optLong("id")).equals(complicationScrollKey)) complicationScrollRow=retained;
+        }
+        JSONArray alarms = committed.phone, groups = cache.optJSONArray("groups");
         if (alarms == null) { note(online ? "Waiting for phone alarms…" : "No cached phone alarms."); return; }
         Set<Long> shown = new HashSet<>();
         if (groups != null) for (int i = 0; i < groups.length(); i++) {

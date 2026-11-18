@@ -34,6 +34,10 @@
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/openclock/v1/" />
             </intent-filter>
             <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/openclock/v2/snooze-reply" />
+            </intent-filter>
+            <intent-filter>
                 <action android:name="com.google.android.gms.wearable.CAPABILITY_CHANGED" />
                 <data android:scheme="wear" android:host="*" android:path="/openclock_phone_v1" />
             </intent-filter>

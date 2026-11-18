@@ -15,6 +15,10 @@ Follow per-alarm sound/vibration, alarm audio/vibration usage, channel and DND p
 
 For user confirmation use the committed `nextTriggerAt`, not reconstructed requested time. The shared `AlarmConfirmation` uses rounded-up relative minutes for under 24 hours and local calendar text otherwise. Show a warning instead of a set claim when access, a future trigger or error-free state is unavailable. Keep phone UI, group aggregation, Wear snapshot confirmation and Binder toast paths separate; do not add an unconditional store toast. Presentation failure must not change a committed mutation.
 
+## Cross-device snooze transactions
+
+Phone-derived fallback tokens are not independent watch alarms. See [Wear ownership and snooze](wear-sync.md#snooze-coordinator-and-receipts) for the versioned exact-session receipt and durable pending-intent rules. Phone snooze and receipt must share one commit; a confirmed receipt must not close a watch ring until its replacement fallback is registered and committed. Unconfirmed outcomes create a separately identified watch-owned one-shot, never a recurring clone. Preserve original outputs/counts and future phone recurrences, commit before cancellation, retain the original on failure, and never retry an uncertain network mutation. Explicit source dismissals and newer authoritative phone state fence late effects; independent branches are not silently canceled by late receipts or phone deletions.
+
 ## Focused regression matrix
 
 Use production code with disposable platform/storage/clock fakes outside the repository when needed; no host fixture should be described as a real Android test. Cover:

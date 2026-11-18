@@ -111,8 +111,8 @@ public final class PhoneMirrorActivity extends Activity {
         final android.content.Context app = getApplicationContext();
         Attempt attempt = new Attempt(); attempts.put(sentKey, attempt); update(current);
         try {
-            JSONObject command = new JSONObject().put("op", "finish").put("id", sentId).put("token", sentToken).put("snooze", wantSnooze);
-            PhoneSync.command(app, command, (ok, safeMessage) -> {
+            WatchSnooze.mirror(app, sentId, sentToken, null, (ok, safeMessage) -> {
+                android.widget.Toast.makeText(app,safeMessage,android.widget.Toast.LENGTH_LONG).show();
                 // A late positive reply is still a real phone acknowledgement for this token.
                 if (ok) { PhoneMirror.acknowledged(app, sentId, sentToken); attempts.remove(sentKey); }
                 else { attempt.pending = false; PhoneSync.requestSnapshot(app); }
@@ -121,7 +121,11 @@ public final class PhoneMirrorActivity extends Activity {
                     else { JSONObject a = PhoneMirror.current(this, id, token); if (a != null) update(a); }
                 }
             });
-        } catch (Exception e) { attempt.pending = false; PhoneSync.requestSnapshot(app); update(current); }
+        } catch (Exception e) {
+            attempt.pending = false;
+            android.widget.Toast.makeText(app,"Snooze unchanged: "+AlarmStore.message(e),android.widget.Toast.LENGTH_LONG).show();
+            PhoneSync.requestSnapshot(app); update(current);
+        }
     }
     @Override protected void onResume() {
         super.onResume(); handler.removeCallbacks(check);

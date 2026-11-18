@@ -10,6 +10,11 @@ final class WearSync {
     private static final java.util.concurrent.ExecutorService fallback = java.util.concurrent.Executors.newSingleThreadExecutor();
     // A persisted recovery job must exist before a dismissal can enter the journal.
     // Failure is advisory: never prevent a local alarm from being stopped.
+    static void recoverSnoozes(Context c) { main.post(()->WatchSnooze.recover(c)); }
+    static boolean routeSnooze(Context c,long id,String token,Integer minutes) {
+        try { return WatchSnooze.local(c,id,token,minutes,null); }
+        catch(Exception failure) { AlarmNotifications.warning(c,"Snooze not completed: "+AlarmStore.message(failure)); return true; }
+    }
     static void beforeCommit(Context c) { PhoneDismissalJob.beforeCommit(c); }
     static boolean enqueueGenericDismissal(org.json.JSONObject state) throws org.json.JSONException {
         return AlarmStore.addGenericDismissal(state);
@@ -35,6 +40,7 @@ final class WearSync {
             app.sendBroadcast(new android.content.Intent(LOCAL_CHANGED).setPackage(app.getPackageName()));
             ComplicationUpdateJob.changed(app, false);
             PhoneDismissalJob.schedule(app);
+            WatchSnooze.recover(app);
         });
     }
     private WearSync() { }

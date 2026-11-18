@@ -64,6 +64,7 @@ public final class ComplicationUpdateJob extends JobService {
             UserManager users = c.getSystemService(UserManager.class);
             JSONObject phone = users != null && users.isUserUnlocked() ? PhoneSync.complicationSnapshot(c) : null;
             return local.getJSONArray("alarms").toString() + "/" + local.getJSONArray("active")
+                    + "/" + local.optJSONArray("phoneFallbacks") + "/" + local.optJSONArray("watchSnoozeRequests")
                     + "/" + (phone == null ? "locked" : phone.optString("epoch") + "/" + phone.optLong("revision", -1)
                     + "/" + phone.optLong("updatedAt") + "/" + phone.optJSONArray("alarms")
                     + "/" + phone.optJSONArray("active") + "/" + phone.optBoolean("complicationUnresolved", true)
