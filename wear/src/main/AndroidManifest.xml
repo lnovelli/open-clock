@@ -47,6 +47,7 @@
             <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT,LONG_TEXT" />
             <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="900" />
         </service>
+
         <service android:name=".ComplicationUpdateJob" android:exported="true" android:directBootAware="true" android:permission="android.permission.BIND_JOB_SERVICE" />
         <receiver android:name=".ComplicationClockReceiver" android:exported="false" android:directBootAware="true">
             <intent-filter>

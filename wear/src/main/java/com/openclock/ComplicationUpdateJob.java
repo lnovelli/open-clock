@@ -89,6 +89,7 @@ public final class ComplicationUpdateJob extends JobService {
                 if (p.getBoolean("force", false) || current == null || !current.equals(lastFingerprint)) {
                     try {
                         ComplicationDataSourceUpdateRequester.create(c, new ComponentName(c, NextAlarmComplication.class)).requestUpdateAll();
+
                         lastFingerprint = current;
                     } catch (RuntimeException e) {
                         android.util.Log.w("OpenClockComplication", "Could not request update");

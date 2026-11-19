@@ -20,6 +20,9 @@ final class AccessLog {
         if (!(value instanceof String)) return REQUEST;
         switch ((String) value) {
             case "alarms.list": case "alarms.create": case "alarms.update": case "alarms.delete": case "alarms.triggerNow":
+            case "alarms.v2.capabilities": case "alarms.v2.list": case "alarms.v2.get": case "alarms.v2.create":
+            case "alarms.v2.triggerNow": case "alarms.v2.update": case "alarms.v2.delete": case "alarms.v2.status":
+            case "alarms.v2.groups.list": case "alarms.v2.groups.create": case "alarms.v2.groups.update": case "alarms.v2.groups.delete":
             case "groups.list": case "groups.create": case "groups.update": case "groups.delete":
             case "groups.addAlarm": case "groups.removeAlarm": return (String) value;
             default: return REQUEST;

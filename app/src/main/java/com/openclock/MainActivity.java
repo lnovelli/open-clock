@@ -70,7 +70,7 @@ public class MainActivity extends Activity {
     private AlertDialog alarmLinkPrompt;
     private NumberPicker hourPicker, minutePicker;
     private EditText labelInput;
-    private Switch enabledSwitch, soundSwitch, vibrationSwitch, snoozeSwitch;
+    private Switch soundSwitch, vibrationSwitch, snoozeSwitch;
     private TextView dateValue, repeatNote, groupValue, snoozeValue, countValue, vibrationValue;
     private final TextView[] dayChips = new TextView[7];
     private final Set<Long> collapsed = new HashSet<>();
@@ -639,9 +639,33 @@ public class MainActivity extends Activity {
     }
 
     private void alarmMenu(JSONObject alarm) {
-        new AlertDialog.Builder(this).setTitle("Alarm " + timeString(alarm)).setItems(new String[]{"Edit alarm", "Delete alarm"}, (d, which) -> {
-            if (which == 0) editAlarm(alarm); else confirmDeleteAlarm(alarm);
+        new AlertDialog.Builder(this).setTitle("Alarm " + timeString(alarm)).setItems(new String[]{"Edit alarm", "Advanced details", "Delete alarm"}, (d, which) -> {
+            if (which == 0) editAlarm(alarm);
+            else if (which == 1) showAlarmIdentity(alarm.optLong("id", -1));
+            else confirmDeleteAlarm(alarm);
         }).show();
+    }
+
+    private void showAlarmIdentity(long id) {
+        try {
+            JSONObject details = AlarmStore.identityDetails(this, id);
+            String uuid = details.getString("uuid");
+            JSONObject origin = details.optJSONObject("origin");
+            String originText = origin == null ? "Unbound" : origin.getString("source") + "\nReference: " + origin.getString("reference");
+            TextView value = text("UUID: " + uuid + "\n\nLegacy ID: " + details.getLong("id")
+                    + "\nRevision: " + details.getLong("revision") + "\nOrigin: " + originText, 14, INK);
+            value.setTextIsSelectable(true);
+            value.setPadding(dp(24), dp(12), dp(24), dp(12));
+            new AlertDialog.Builder(this).setTitle("Advanced alarm details").setView(value)
+                    .setNegativeButton("Close", null).setPositiveButton("Copy UUID", (dialog, which) -> {
+                        try {
+                            android.content.ClipboardManager clipboard = getSystemService(android.content.ClipboardManager.class);
+                            if (clipboard == null) { toast("Clipboard unavailable"); return; }
+                            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Alarm UUID", uuid));
+                            toast("Alarm UUID copied");
+                        } catch (RuntimeException e) { failure("Could not copy alarm UUID", e); }
+                    }).show();
+        } catch (Exception e) { failure("Could not read alarm details", e); }
     }
 
     private void newAlarm() {
@@ -677,8 +701,8 @@ public class MainActivity extends Activity {
         clock.setPadding(dp(14), 0, dp(14), dp(20));
         hourPicker = numberPicker(0, 23, draft.optInt("hour", 7), true);
         minutePicker = numberPicker(0, 59, draft.optInt("minute"), true);
-        hourPicker.setOnValueChangedListener((picker, oldValue, newValue) -> picker.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK));
-        minutePicker.setOnValueChangedListener((picker, oldValue, newValue) -> picker.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK));
+        hourPicker.setOnValueChangedListener((picker, oldValue, newValue) -> picker.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS));
+        minutePicker.setOnValueChangedListener((picker, oldValue, newValue) -> picker.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS));
         hourPicker.setContentDescription("Hour, 24-hour time");
         minutePicker.setContentDescription("Minute");
         clock.addView(hourPicker, new LinearLayout.LayoutParams(0, dp(164), 1));
@@ -727,14 +751,6 @@ public class MainActivity extends Activity {
         labelInput.setText(draft.optString("label", ""));
         options.addView(labelInput, new LinearLayout.LayoutParams(-1, dp(52)));
         divider(options);
-        if (draft.has("id")) {
-            enabledSwitch = null;
-            LinearLayout enabledInfo = optionRow("Alarm enabled", "Saving enables this alarm");
-            options.addView(enabledInfo);
-        } else {
-            enabledSwitch = addSwitchOption(options, "Alarm enabled", "Turn off to keep without scheduling", draft.optBoolean("enabled", true));
-        }
-        divider(options);
         soundSwitch = addSwitchOption(options, "Alarm sound", "Standard system alarm tone", draft.optBoolean("sound", true));
         divider(options);
         vibrationSwitch = addSwitchOption(options, "Vibration", "Vibrate when the alarm rings", draft.optBoolean("vibrate", true));
@@ -770,6 +786,8 @@ public class MainActivity extends Activity {
         policy.setPadding(dp(8), dp(8), dp(8), dp(8));
         body.addView(policy);
         if (draft.has("id")) {
+            final long savedId = draft.optLong("id", -1);
+            body.addView(button("Advanced details", false, v -> showAlarmIdentity(savedId)));
             TextView delete = button("Delete alarm", false, v -> confirmDeleteAlarm(draft));
             delete.setTextColor(RED);
             body.addView(delete);
@@ -785,7 +803,6 @@ public class MainActivity extends Activity {
         try {
             draft.put("hour", hourPicker.getValue()); draft.put("minute", minutePicker.getValue());
             draft.put("label", labelInput.getText().toString().trim());
-            if (enabledSwitch != null) draft.put("enabled", enabledSwitch.isChecked());
             draft.put("sound", soundSwitch.isChecked());
             draft.put("vibrate", vibrationSwitch.isChecked()); draft.put("snoozeEnabled", snoozeSwitch.isChecked());
         } catch (Exception ignored) { }

@@ -44,10 +44,13 @@ final class ComplicationDisplay {
         if (uncertain) out.append("; phone or alarm state unverified");
         return out.toString();
     }
-    static final class ShortFields {
-        final String text, title;
-        final boolean dot;
-        ShortFields(String text, String title, boolean dot) { this.text = text; this.title = title; this.dot = dot; }
+    String items(List<Long> times, long now) {
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < Math.min(times.size(), ComplicationPolicy.DISPLAY_LIMIT); i++) {
+            if (i > 0) text.append("  •  ");
+            text.append(item(times.get(i), now));
+        }
+        return text.toString();
     }
     private String shortTime(long at, int max) {
         String preferred = time(at);
@@ -56,31 +59,13 @@ final class ComplicationDisplay {
         String fallback = compact(format(short24Pattern, at));
         return fallback.length() <= max ? fallback : null;
     }
-    ShortFields shortFields(List<Long> times, boolean uncertain, long now) {
-        if (times.isEmpty()) return new ShortFields(uncertain ? "Check" : "No", uncertain ? null : "alarms", false);
+    String shortText(List<Long> times, boolean uncertain, long now) {
+        if (times.isEmpty()) return uncertain ? "Check" : "None";
         long first = times.get(0);
-        String marker = uncertain ? "?" : "";
-        // Edge faces sometimes ignore the optional title completely. Keep all
-        // alarms in the required text even though this exceeds the platform's
-        // seven-character short-text guidance; constrained faces may truncate.
-        if (times.size() > 1) {
-            StringBuilder text = new StringBuilder(marker);
-            for (int i = 0; i < Math.min(times.size(), ComplicationPolicy.DISPLAY_LIMIT); i++) {
-                if (i > 0) text.append('•');
-                text.append(item(times.get(i), now));
-            }
-            return new ShortFields(text.toString(), null, true);
-        }
-        if (distant(first, now)) {
-            String date = date(first);
-            String time = shortTime(first, 7);
-            // A face may omit the title. Showing the date in the required field avoids
-            // presenting a distant alarm as an apparently imminent time.
-            if ((marker + date).length() > 7 || time == null) return new ShortFields("Check", null, false);
-            return new ShortFields(marker + date, time, false);
-        }
-        String time = shortTime(first, 7 - marker.length());
-        if (time == null) return new ShortFields("Check", null, false);
-        return new ShortFields(marker + time, null, false);
+        if (times.size() > 1) return items(times, now);
+        String time = shortTime(first, 7);
+        if (time == null) return "Check";
+        // Keep date and time together when no title is supplied; faces may truncate.
+        return distant(first, now) ? date(first) + " " + time : time;
     }
 }

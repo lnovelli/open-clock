@@ -21,7 +21,8 @@ import org.json.JSONObject;
 /** Read committed state only; never start phone discovery from a provider request. */
 public final class NextAlarmComplication extends ComplicationDataSourceService {
     private static final ExecutorService READS = Executors.newSingleThreadExecutor();
-    private static final int DOT_COLOR = 0xffb995ff;
+    private static final int NEXT_COLOR = 0xffb995ff;
+    private static final int DOT_COLOR = 0xffffa640;
 
     @Override public void onComplicationRequest(ComplicationRequest request, ComplicationRequestListener listener) {
         ComplicationType type = request.getComplicationType();
@@ -74,14 +75,19 @@ public final class NextAlarmComplication extends ComplicationDataSourceService {
         boolean use24 = android.text.format.DateFormat.is24HourFormat(this);
         return new ComplicationDisplay(locale, TimeZone.getDefault(),
                 android.text.format.DateFormat.getBestDateTimePattern(locale, use24 ? "Hm" : "hm"),
-                android.text.format.DateFormat.getBestDateTimePattern(locale, "Md"),
+                "d/M", // Show day before month regardless of the watch locale.
                 android.text.format.DateFormat.getBestDateTimePattern(locale, "Hm"));
     }
     private static ComplicationText plain(CharSequence text) {
         return new PlainComplicationText.Builder(text).build();
     }
-    private static CharSequence coloredDot(String text) {
+    private static CharSequence styledAlarms(String text, boolean hasAlarm) {
         SpannableString styled = new SpannableString(text);
+        if (hasAlarm) {
+            int firstEnd = text.indexOf("  •  ");
+            if (firstEnd < 0) firstEnd = text.length();
+            styled.setSpan(new ForegroundColorSpan(NEXT_COLOR), 0, firstEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
         for (int index = text.indexOf('•'); index >= 0; index = text.indexOf('•', index + 1))
             styled.setSpan(new ForegroundColorSpan(DOT_COLOR), index, index + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         return styled;
@@ -89,22 +95,16 @@ public final class NextAlarmComplication extends ComplicationDataSourceService {
     private ComplicationData data(ComplicationType type, List<Long> times, boolean uncertain, long now, ComplicationDisplay display) {
         ComplicationText description = plain(display.description(times, uncertain, now));
         if (type == ComplicationType.LONG_TEXT) {
-            String text;
-            if (times.isEmpty()) text = uncertain ? "Check" : "No alarms";
-            else {
-                StringBuilder items = new StringBuilder(uncertain ? "?" : "");
-                for (int i = 0; i < Math.min(times.size(), ComplicationPolicy.DISPLAY_LIMIT); i++) {
-                    if (i > 0) items.append(" • ");
-                    items.append(display.item(times.get(i), now));
-                }
-                text = items.toString();
-            }
-            return new LongTextComplicationData.Builder(plain(coloredDot(text)), description).setTapAction(open()).build();
+            String text = times.isEmpty() ? (uncertain ? "Check" : "No alarms")
+                    : display.items(times, now);
+            LongTextComplicationData.Builder longData = new LongTextComplicationData.Builder(
+                    plain(styledAlarms(text, !times.isEmpty())), description).setTapAction(open());
+            return longData.build();
         }
-        ComplicationDisplay.ShortFields fields = display.shortFields(times, uncertain, now);
+        String text = display.shortText(times, uncertain, now);
         ShortTextComplicationData.Builder shortData = new ShortTextComplicationData.Builder(
-                plain(fields.dot ? coloredDot(fields.text) : fields.text), description).setTapAction(open());
-        if (fields.title != null) shortData.setTitle(plain(fields.title));
+                plain(styledAlarms(text, !times.isEmpty() && !text.equals("Check"))), description)
+                .setTapAction(open());
         return shortData.build();
     }
     @Override public ComplicationData getPreviewData(ComplicationType type) {

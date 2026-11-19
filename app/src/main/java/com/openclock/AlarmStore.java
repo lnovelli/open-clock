@@ -32,21 +32,42 @@ public final class AlarmStore {
     private static android.util.AtomicFile file(Context c) {
         return new android.util.AtomicFile(new java.io.File(c.createDeviceProtectedStorageContext().getNoBackupFilesDir(), "alarms-v1.json"));
     }
-    private static JSONObject state(Context c) {
+    static synchronized JSONObject state(Context c) {
         android.util.AtomicFile f=file(c);
         try {
             if(!f.getBaseFile().exists()&&!new java.io.File(f.getBaseFile()+".bak").exists())
-                return new JSONObject("{\"alarms\":[],\"groups\":[],\"nextId\":1}");
+                return new JSONObject("{\"alarms\":[],\"groups\":[],\"nextId\":1,\"_identityVersion\":2,\"_groupRevisionVersion\":1}");
             byte[] data=f.readFully();
             if(data.length>2_000_000) throw new java.io.IOException("Alarm storage is too large");
-            return new JSONObject(new String(data,java.nio.charset.StandardCharsets.UTF_8));
+            JSONObject state=new JSONObject(new String(data,java.nio.charset.StandardCharsets.UTF_8));
+            // Identity-only migration: no scheduler/recovery/occurrence changes.
+            if(AlarmIdentity.migrate(state)) writeIdentityMigration(f,state);
+            return state;
         } catch(Exception e) { throw new IllegalStateException("Alarm storage is unreadable; refusing to overwrite it",e); }
+    }
+    private static void writeIdentityMigration(android.util.AtomicFile f,JSONObject state) throws Exception {
+        byte[] bytes=state.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        if(bytes.length>2_000_000) throw new java.io.IOException("Identity migration exceeds storage capacity");
+        java.io.FileOutputStream stream=null;
+        try {
+            stream=f.startWrite(); stream.write(bytes);
+            stream.flush(); stream.getFD().sync(); f.finishWrite(stream);
+            if(!java.util.Arrays.equals(f.readFully(),bytes))
+                throw new java.io.IOException("Identity migration commit could not be verified");
+        } catch(Exception failure) { if(stream!=null) f.failWrite(stream); throw failure; }
     }
     private static void commit(Context c, JSONObject state) throws Exception { commit(c,state,0,0); }
     private static void commit(Context c, JSONObject state,long expiresAt,long deadlineElapsed) throws Exception {
         // Install recovery BEFORE persistence: a committed active session must have a
         // platform-owned wakeup even if the process dies before service startup.
         JSONObject recoveryState=new JSONObject(state.toString()), priorState=AlarmStore.state(c);
+        AlarmV2.beforeIdentityCommit(state);
+        AlarmIdentity.groupRevisions(state,priorState);
+        AlarmIdentity.revisions(state,priorState);
+        AlarmV2.recordCommit(c,state);
+        if(AlarmV2.pendingExpiry()!=0) {
+            expiresAt=AlarmV2.pendingExpiry(); deadlineElapsed=AlarmV2.pendingDeadline();
+        }
         JSONArray union=recoveryState.getJSONArray("alarms"), previous=priorState.getJSONArray("alarms");
         if(priorState.has("_phoneStaged")) recoveryState.put("_phoneStaged",priorState.getJSONArray("_phoneStaged"));
         for(int i=0;i<previous.length();i++) union.put(previous.getJSONObject(i));
@@ -84,14 +105,25 @@ public final class AlarmStore {
         state.put("_wearRevision", Math.addExact(state.optLong("_wearRevision", 0), 1));
         if(state.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>2_000_000)
             throw new IllegalStateException("Alarm storage limit reached");
-        android.util.AtomicFile f=file(c); java.io.FileOutputStream stream=null;
+        android.util.AtomicFile f=file(c); java.io.FileOutputStream stream=null; boolean finishingV2=false;
         try {
             stream=f.startWrite(); stream.write(state.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
             stream.flush(); stream.getFD().sync();
+            AlarmV2.checkExpiry();
             if(expiresAt!=0&&(System.currentTimeMillis()>expiresAt||android.os.SystemClock.elapsedRealtime()>deadlineElapsed))
                 throw new IllegalArgumentException("Request expired");
+            finishingV2=AlarmV2.pendingExpiry()!=0;
+            if(finishingV2) AlarmV2.finishingCommit();
             f.finishWrite(stream);
-        } catch(Exception e) { if(stream!=null) f.failWrite(stream); throw new java.io.IOException("Could not persist alarm changes",e); }
+            if(finishingV2&&!java.util.Arrays.equals(f.readFully(),state.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                throw new java.io.IOException("Alarm commit could not be verified");
+        } catch(Exception e) {
+            // Once rename has begun an I/O failure is an uncertain outcome. Keep
+            // registrations for both possible durable states; never undo a receipt.
+            if(stream!=null&&!finishingV2) f.failWrite(stream);
+            throw new java.io.IOException("Could not persist alarm changes",e);
+        }
+        AlarmV2.didCommit();
         try { WearSync.afterCommit(c); }
         catch(RuntimeException ignored) { /* advisory sync cannot change alarm result */ }
     }
@@ -103,7 +135,7 @@ public final class AlarmStore {
         for (int i=0;i<list.length();i++) if(list.optJSONObject(i).optLong("id")==id) return i;
         return -1;
     }
-    private static JSONObject publicAlarm(JSONObject a) throws JSONException {
+    static JSONObject publicAlarm(JSONObject a) throws JSONException {
         JSONObject out = new JSONObject(a.toString());
         Iterator<String> keys = out.keys(); List<String> remove = new ArrayList<>();
         while(keys.hasNext()) { String k=keys.next(); if(k.startsWith("_")) remove.add(k); }
@@ -135,8 +167,26 @@ public final class AlarmStore {
         return result;
     }
     public static synchronized JSONArray groups(Context c) {
-        try { return new JSONArray(state(c).getJSONArray("groups").toString()); }
+        try {
+            JSONArray stored=state(c).getJSONArray("groups"), result=new JSONArray();
+            for(int i=0;i<stored.length();i++) {
+                JSONObject group=new JSONObject(stored.getJSONObject(i).toString());
+                List<String> remove=new ArrayList<>(); Iterator<String> keys=group.keys();
+                while(keys.hasNext()) { String key=keys.next(); if(key.startsWith("_")) remove.add(key); }
+                for(String key:remove) group.remove(key);
+                result.put(group);
+            }
+            return result;
+        }
         catch(JSONException e) { throw new IllegalStateException(e); }
+    }
+    /** Read-only local UI details, deliberately separate from legacy serialization. */
+    static synchronized JSONObject identityDetails(Context c,long id) throws Exception {
+        JSONObject alarm=find(state(c).getJSONArray("alarms"),id);
+        if(alarm==null||alarm.optBoolean("_phoneFallback")) throw new IllegalArgumentException("Alarm no longer exists");
+        return new JSONObject().put("id",id).put("uuid",alarm.getString("_uuid"))
+            .put("revision",alarm.getLong("_revision"))
+            .put("origin",alarm.has("_origin")?new JSONObject(alarm.getJSONObject("_origin").toString()):JSONObject.NULL);
     }
     /** Watch caller: hidden phone rows share the device-protected alarm journal,
      * local ID namespace, generation tokens, recovery and registration protocol. */
@@ -152,13 +202,23 @@ public final class AlarmStore {
         if(!phoneSnapshotAllowed(s,node,epoch,revision,published)) throw new IllegalArgumentException("Stale or retired phone snapshot");
         if(same&&(revision<s.optLong("_phoneRevision",-1)||(revision==s.optLong("_phoneRevision",-1)
                 &&published<s.optLong("_phonePublished",0)))) return;
-        Set<Long> ids=new HashSet<>(); List<JSONObject> source=new ArrayList<>();
+        Set<Long> ids=new HashSet<>(); Set<String> sourceUuids=new HashSet<>(); List<JSONObject> source=new ArrayList<>();
         // Validate the entire input before changing registrations or state.
         for(int i=0;i<input.length();i++) {
             JSONObject row=input.getJSONObject(i); long id=integer(row,"id",0,1,Long.MAX_VALUE);
             if(!ids.add(id)||!(row.opt("enabled") instanceof Boolean)) throw new IllegalArgumentException("Invalid phone alarms");
             JSONObject clean=new JSONObject(row.toString()); clean.put("groupId",JSONObject.NULL);
             JSONObject validated=canonical(clean,null,1,new JSONArray());
+            AlarmIdentity.fallback(validated,row);
+            if(validated.has("_uuid")&&!sourceUuids.add(validated.getString("_uuid")))
+                throw new IllegalArgumentException("Duplicate phone UUID");
+            for(int j=0;j<rows.length();j++) {
+                JSONObject prior=rows.getJSONObject(j);
+                if(prior.optBoolean("_phoneFallback")&&node.equals(prior.optString("_phoneNode"))&&epoch.equals(prior.optString("_phoneEpoch"))
+                        &&id==prior.optLong("_phoneId")&&prior.has("_uuid")&&validated.has("_uuid")
+                        &&!prior.getString("_uuid").equals(validated.getString("_uuid")))
+                    throw new IllegalArgumentException("Phone alarm identity changed");
+            }
             long next=integer(row,"nextTriggerAt",0,0,Long.MAX_VALUE);
             long snooze=integer(row,"snoozedUntil",0,0,Long.MAX_VALUE);
             validated.put("_sourceId",id).put("_sourceNext",next).put("_sourceSnooze",snooze);
@@ -454,8 +514,17 @@ public final class AlarmStore {
                 if(old==null) { rows.put(a); fallbackCount++; } else { rows.put(index(rows,localId),a); obsolete.add(old); }
             }
             JSONArray acceptedRows=new JSONArray();
-            for(JSONObject src:source) acceptedRows.put(publicAlarm(src).put("id",src.getLong("_sourceId")).put("nextTriggerAt",src.getLong("_sourceNext"))
-                .put("snoozedUntil",src.getLong("_sourceSnooze")).put("occurrenceId",src.optString("_sourceOccurrenceId")));
+            for(JSONObject src:source) {
+                JSONObject accepted=publicAlarm(src).put("id",src.getLong("_sourceId"))
+                    .put("nextTriggerAt",src.getLong("_sourceNext"))
+                    .put("snoozedUntil",src.getLong("_sourceSnooze"))
+                    .put("occurrenceId",src.optString("_sourceOccurrenceId"));
+                // The accepted snapshot is also used to recreate phone-owned
+                // fallbacks after a snooze receipt. Preserve known source identity
+                // there; an older peer with no UUID remains explicitly unknown.
+                if(src.has("_uuid")) accepted.put("uuid",src.getString("_uuid"));
+                acceptedRows.put(accepted);
+            }
             s.put("_phoneNode",node).put("_phoneEpoch",epoch).put("_phoneRevision",revision).put("_phonePublished",published)
                 .put("_phoneAccepted",new JSONObject().put("alarms",acceptedRows));
             if(pending) s.put("_phoneDesired",new JSONObject(snapshot.toString())).put("_phoneDesiredNode",node).put("_phoneRetryAt",now+RETRY_DELAY);
@@ -707,6 +776,7 @@ public final class AlarmStore {
         JSONArray ringing=new JSONArray();
         for(int i=0;i<published.length();i++) {
             JSONObject row=published.getJSONObject(i), stored=find(rows,row.getLong("id"));
+            row.put("uuid",stored.getString("_uuid")).put("revision",stored.getLong("_revision"));
             String pending=stored.optString("_token","");
             String dismissed=stored.optString("_lastDismissedOccurrenceId","");
             if(occurrenceId(pending)) row.put("occurrenceId",pending);
@@ -963,6 +1033,7 @@ public final class AlarmStore {
             }
         }
         boolean edit=input.has("id"); long id=edit?integer(input,"id",0,1,Long.MAX_VALUE):s.getLong("nextId");
+        long followingId=edit?0:Math.addExact(id,1);
         JSONObject old=find(as,id); if(edit&&old==null) throw new IllegalArgumentException("Alarm does not exist");
         if(!edit&&as.length()>=500) throw new IllegalArgumentException("Alarm limit reached");
         JSONObject a=canonical(input,old,id,s.getJSONArray("groups"));
@@ -973,6 +1044,7 @@ public final class AlarmStore {
             List<String> remove=new ArrayList<>(); Iterator<String> runtime=a.keys();
             while(runtime.hasNext()) { String key=runtime.next(); if(key.startsWith("_")) remove.add(key); }
             for(String key:remove) a.remove(key);
+            if(old!=null) AlarmIdentity.preserve(old,a);
             if(old!=null&&occurrenceId(old.optString("_lastDismissedOccurrenceId","")))
                 a.put("_lastDismissedOccurrenceId",old.getString("_lastDismissedOccurrenceId"));
             if(old!=null&&occurrenceId(old.optString("_lastDismissedSessionToken","")))
@@ -985,7 +1057,7 @@ public final class AlarmStore {
                 requireAccess(c); prepare(c,a,System.currentTimeMillis());
             }
         }
-        if(edit) as.put(index(as,id),a); else { as.put(a); s.put("nextId",id+1); }
+        if(edit) as.put(index(as,id),a); else { as.put(a); s.put("nextId",followingId); }
         JSONObject receipt=null;
         try {
             if(receipts!=null) {
@@ -1124,9 +1196,11 @@ public final class AlarmStore {
         if(edit&&find(gs,id)==null) throw new IllegalArgumentException("Group does not exist");
         if(!edit&&gs.length()>=100) throw new IllegalArgumentException("Group limit reached");
         String name=text(input,"name","",100); if(name.isEmpty()) throw new IllegalArgumentException("Group name is required");
-        JSONObject g=new JSONObject().put("id",id).put("name",name);
-        if(edit) gs.put(index(gs,id),g); else {gs.put(g);s.put("nextId",id+1);}
-        commit(c,s); return new JSONObject(g.toString());
+        JSONObject old=edit?find(gs,id):null;
+        JSONObject g=old==null?new JSONObject():new JSONObject(old.toString());
+        g.put("id",id).put("name",name);
+        if(edit) gs.put(index(gs,id),g); else {gs.put(g);s.put("nextId",Math.addExact(id,1));}
+        commit(c,s); return new JSONObject().put("id",id).put("name",name);
     }
     public static synchronized void deleteGroup(Context c,long id) throws Exception {
         JSONObject s=state(c); JSONArray gs=s.getJSONArray("groups"); int i=index(gs,id);
@@ -1208,6 +1282,7 @@ public final class AlarmStore {
         }
     }
     private static void cancel(Context c,JSONObject a) {
+        if(AlarmV2.retainTentative()) return;
         if(!a.has("_token")) return;
         PendingIntent pi=trigger(c,a,PendingIntent.FLAG_NO_CREATE);
         if(pi!=null) { c.getSystemService(AlarmManager.class).cancel(pi); pi.cancel(); }
@@ -1824,6 +1899,7 @@ public final class AlarmStore {
     // These outbox operations change no registrations or active sessions. Do not
     // call commit(), which arms Android recovery via Binder while holding the lock.
     private static void journalOnly(Context c,JSONObject s,long expiresAt) throws Exception {
+        AlarmIdentity.revisions(s,state(c));
         byte[] bytes=s.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         if(bytes.length>2_000_000) throw new IllegalStateException("Alarm storage limit reached");
         android.util.AtomicFile f=file(c); java.io.FileOutputStream stream=null;
@@ -2255,6 +2331,7 @@ public final class AlarmStore {
                 JSONObject input=new JSONObject((phoneAlarm==null?r.getJSONObject("template"):phoneAlarm).toString()); input.remove("groupId");
                 input.put("enabled",true);
                 replacement=canonical(input,null,s.getLong("nextId"),s.getJSONArray("groups"));
+                AlarmIdentity.fallback(replacement,phoneAlarm==null?new JSONObject():phoneAlarm);
                 s.put("nextId",s.getLong("nextId")+1);
             } else replacement=new JSONObject(old.toString());
             // These describe the imported ORIGINAL ring, not the receipt's new generation.
