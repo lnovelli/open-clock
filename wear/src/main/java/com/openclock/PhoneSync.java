@@ -40,6 +40,8 @@ public final class PhoneSync {
     private static final Handler MAIN=new Handler(Looper.getMainLooper());
     private static final java.util.concurrent.ExecutorService FETCH=java.util.concurrent.Executors.newSingleThreadExecutor();
     private static final java.util.concurrent.ExecutorService SEND=java.util.concurrent.Executors.newSingleThreadExecutor();
+    // Deadlines/failure callbacks must not wait for fallback/store locks on MAIN.
+    private static final java.util.concurrent.ScheduledExecutorService EVENTS=java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
     private static final AtomicBoolean fetching=new AtomicBoolean(), dirty=new AtomicBoolean(), wantsRequest=new AtomicBoolean();
     private static volatile boolean lastReadComplete;
     private static JSONObject snapshot;
@@ -145,11 +147,11 @@ public final class PhoneSync {
         } catch (InterruptedException stopped) { Thread.currentThread().interrupt(); return false; }
         catch (Exception ignored) { return false; /* A later event or job retries. */ }
     }
-    private static void broadcast(Context c) { MAIN.post(()->{
+    private static void broadcast(Context c) {
         WatchSnooze.recover(c);
-        c.sendBroadcast(new Intent(ACTION_CHANGED).setPackage(c.getPackageName()));
-        ComplicationUpdateJob.changed(c, false);
-    }); }
+        MAIN.post(() -> c.sendBroadcast(new Intent(ACTION_CHANGED).setPackage(c.getPackageName())));
+        EVENTS.execute(() -> ComplicationUpdateJob.changed(c, false));
+    }
     private static void startFetch(Context c,boolean request) {
         if(request) wantsRequest.set(true);
         if(!fetching.compareAndSet(false,true)) { dirty.set(true); return; }
@@ -289,11 +291,11 @@ public final class PhoneSync {
             }
         } catch(Exception e) { MAIN.post(()->callback.onResult(false,"Phone unavailable or snapshot not ready; refresh")); return; }
         broadcast(c);
-        MAIN.postDelayed(()->finish(c,id,false,"Result unknown; refresh on watch"),25_000);
+        EVENTS.schedule(()->finish(c,id,false,"Result unknown; refresh on watch"),25_000,TimeUnit.MILLISECONDS);
         sendCommand(c,id,node,epoch,op,alarm,token,value,rev);
         if("finish".equals(op)&&!value) {
-            MAIN.postDelayed(()->sendCommand(c,id,node,epoch,op,alarm,token,value,rev),7_000);
-            MAIN.postDelayed(()->sendCommand(c,id,node,epoch,op,alarm,token,value,rev),14_000);
+            EVENTS.schedule(()->sendCommand(c,id,node,epoch,op,alarm,token,value,rev),7_000,TimeUnit.MILLISECONDS);
+            EVENTS.schedule(()->sendCommand(c,id,node,epoch,op,alarm,token,value,rev),14_000,TimeUnit.MILLISECONDS);
         }
     }
     private static boolean canonicalUuid(String value) {
@@ -447,7 +449,7 @@ public final class PhoneSync {
                 if("setEnabled".equals(op)) cmd.put("enabled",value).put("revision",rev);
                 else cmd.put("token",token).put("snooze",value);
                 Wearable.getMessageClient(c).sendMessage(node,COMMAND,cmd.toString().getBytes(StandardCharsets.UTF_8))
-                    .addOnFailureListener(e->commandFailure(c,id));
+                    .addOnFailureListener(EVENTS,e->commandFailure(c,id));
             } catch(Exception e) { commandFailure(c,id); }
         });
     }
@@ -564,7 +566,7 @@ public final class PhoneSync {
     }
     private static void sendCreate(Context c,String id,String node,String epoch,String path,byte[] body) {
         final long attempt; synchronized(PhoneSync.class) { attempt=createAttempt; }
-        MAIN.postDelayed(()->finishCreateAttempt(c,id,attempt),25_000);
+        EVENTS.schedule(()->finishCreateAttempt(c,id,attempt),25_000,TimeUnit.MILLISECONDS);
         SEND.execute(()->{
             try {
                 if(!node.equals(onePhone(c))) { finishCreateAttempt(c,id,attempt); return; }
@@ -574,7 +576,7 @@ public final class PhoneSync {
                         finishCreateAttempt(c,id,attempt); return;
                     }
                     Wearable.getMessageClient(c).sendMessage(node,path,body)
-                        .addOnFailureListener(e->finishCreateAttempt(c,id,attempt));
+                        .addOnFailureListener(EVENTS,e->finishCreateAttempt(c,id,attempt));
                 }
             } catch(Exception e) { finishCreateAttempt(c,id,attempt); }
         });
@@ -742,7 +744,7 @@ public final class PhoneSync {
     }
     private static void sendMutation(Context c,String id,String node,String epoch,String path,byte[] body) {
         final long attempt; synchronized(PhoneSync.class) { attempt=mutationAttempt; }
-        MAIN.postDelayed(()->finishMutationAttempt(c,id,attempt),25_000);
+        EVENTS.schedule(()->finishMutationAttempt(c,id,attempt),25_000,TimeUnit.MILLISECONDS);
         SEND.execute(()->{
             try {
                 if(!node.equals(onePhone(c))) { finishMutationAttempt(c,id,attempt); return; }
@@ -751,7 +753,7 @@ public final class PhoneSync {
                         !epoch.equals(snapshot.optString("epoch"))||SystemClock.elapsedRealtime()>=connectedUntil) {
                         finishMutationAttempt(c,id,attempt); return;
                     }
-                    Wearable.getMessageClient(c).sendMessage(node,path,body).addOnFailureListener(e->finishMutationAttempt(c,id,attempt));
+                    Wearable.getMessageClient(c).sendMessage(node,path,body).addOnFailureListener(EVENTS,e->finishMutationAttempt(c,id,attempt));
                 }
             } catch(Exception e) { finishMutationAttempt(c,id,attempt); }
         });

@@ -38,9 +38,13 @@ final class WearSync {
         main.post(() -> {
             queued.set(false);
             app.sendBroadcast(new android.content.Intent(LOCAL_CHANGED).setPackage(app.getPackageName()));
-            ComplicationUpdateJob.changed(app, false);
-            PhoneDismissalJob.schedule(app);
-            WatchSnooze.recover(app);
+            // These helpers can persist SharedPreferences and wait for engine
+            // locks. A UI invalidation must never bring that work back to MAIN.
+            fallback.execute(() -> {
+                ComplicationUpdateJob.changed(app, false);
+                PhoneDismissalJob.schedule(app);
+                WatchSnooze.recover(app);
+            });
         });
     }
     private WearSync() { }

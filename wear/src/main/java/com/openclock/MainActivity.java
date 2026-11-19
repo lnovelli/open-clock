@@ -49,11 +49,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Calendar;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
 
 /** Small, self-contained watch UI. The watch store and phone cache are separate authorities. */
 public class MainActivity extends Activity {
@@ -61,6 +57,14 @@ public class MainActivity extends Activity {
     private static final int BG = Color.BLACK, CARD = 0xff28292d, WHITE = 0xfff3f3f5;
     private static final int MUTED = 0xffbec0c8, BLUE = 0xffa7bfff, RED = 0xffffb4ab;
     private static final long FRESH_MS = 5 * 60 * 1000L;
+    private WatchUiData data = new WatchUiData();
+    private WatchUiWork work;
+    private android.widget.FrameLayout windowRoot;
+    private View progress;
+    private boolean loading, reloadAgain;
+    private long dataGeneration;
+    private int savedListScroll;
+    private boolean renderedListAvailable, restoringListScroll;
     private LinearLayout content;
     private ScrollView scroll;
     private SwipeDismissFrameLayout swipeRoot;
@@ -68,6 +72,7 @@ public class MainActivity extends Activity {
     private int hour, minute, month, day;
     private boolean hasDate, sound = false, vibrate = true;
     private boolean createOnPhone;
+    private boolean interruptedOperation;
     private long editingId = -1;
     private String editingOriginal = "";
     private String editingTarget = "";
@@ -75,18 +80,7 @@ public class MainActivity extends Activity {
     private String chosenDate = "";
     private String draftCreateId = "", renderedCreateStatus = "";
     private String label = "";
-    private final Set<Long> pending = new HashSet<>();
-    private final Map<Long, Long> pendingRefresh = new HashMap<>();
-    private final Map<Long, Boolean> pendingExpected = new HashMap<>();
-    private static final class PhoneConfirmation {
-        final String epoch;
-        final long revision;
-        PhoneConfirmation(String epoch, long revision) { this.epoch = epoch; this.revision = revision; }
-    }
-    private final Map<Long, PhoneConfirmation> phoneConfirmations = new HashMap<>();
     private String phoneNotice = "";
-    private boolean createBusy;
-    private boolean mutationBusy;
     private boolean registered;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private boolean complicationScrollPending;
@@ -102,37 +96,18 @@ public class MainActivity extends Activity {
     };
     private int renderedPage = -1;
     private String renderedListState = "";
-    private long awaitingAfter;
     private final BroadcastReceiver phoneChanged = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
-            if (WearSync.LOCAL_CHANGED.equals(intent.getAction()) || "com.openclock.PHONE_MIRROR_CHANGED".equals(intent.getAction())) {
-                if (page == 0) renderListIfChanged();
-                return;
-            }
-            long updated = snapshot().optLong("updatedAt", 0);
-            reconcilePending();
-            reconcilePhoneConfirmations();
-            if (awaitingAfter > 0 && updated > awaitingAfter) {
-                awaitingAfter = 0;
-                phoneNotice = "Phone snapshot updated.";
-            }
-            if (page == 2 && createOnPhone && editingId > 0) {
-                try {
-                    JSONObject p = PhoneSync.pendingMutation(context);
-                    if (p != null && "committed".equals(p.optString("status"))
-                            && p.optString("requestId").equals(new JSONObject(editingTarget).optString("requestId"))) {
-                        mutationBusy = false; page = 0; phoneNotice = "Phone confirmed the change.";
-                    }
-                } catch (Exception ignored) { }
-            }
-            if (page == 0) renderListIfChanged();
-            else if (page == 2 && createOnPhone && !draftCreateId.isEmpty()
-                    && !draftCreateStatus().equals(renderedCreateStatus)) render();
+            reloadData();
         }
     };
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        Object retained = getLastNonConfigurationInstance();
+        work = retained instanceof WatchUiWork ? (WatchUiWork) retained : new WatchUiWork();
+        interruptedOperation = state != null && !(retained instanceof WatchUiWork)
+            && state.getBoolean("operationActive", false);
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
@@ -152,12 +127,18 @@ public class MainActivity extends Activity {
             chosenDate = state.getString("chosenDate", "");
         }
         if (state == null && ACTION_OPEN_COMPLICATION.equals(getIntent().getAction())) beginComplicationScroll();
+        if (state != null) savedListScroll = state.getInt("listScroll", 0);
         render();
+        reloadData();
     }
+
+    @Override public Object onRetainNonConfigurationInstance() { return work; }
+    @Override protected void onDestroy() { work.detach(this); super.onDestroy(); }
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if (!ACTION_OPEN_COMPLICATION.equals(intent.getAction())) return;
+        if (work.busy()) return;
         if (page != 0) {
             // Leave an in-progress editor and its draft intact underneath the new list.
             startActivity(new Intent(this, MainActivity.class).setAction(ACTION_OPEN_COMPLICATION));
@@ -174,6 +155,7 @@ public class MainActivity extends Activity {
     }
 
     @Override public boolean dispatchTouchEvent(MotionEvent event) {
+        if (work != null && work.busy()) return true;
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN && complicationScrollPending) {
             complicationScrollPending = false;
             uiHandler.removeCallbacks(expireComplicationScroll);
@@ -182,17 +164,7 @@ public class MainActivity extends Activity {
     }
 
     private String nextKnownAlarmKey() {
-        ComplicationPolicy.Selection selection = new ComplicationPolicy.Selection();
-        long now = System.currentTimeMillis();
-        try {
-            JSONObject local = AlarmStore.wearSnapshot(this);
-            selection.rows("watch", local.getJSONArray("alarms"), local.getJSONArray("active"), now);
-        } catch (Exception ignored) { }
-        try {
-            JSONObject phone = PhoneSync.complicationSnapshot(this);
-            WatchSchedule.select(selection,WatchSchedule.read(this,phone),now);
-        } catch (Exception ignored) { }
-        return selection.firstKey();
+        return data.nextKey;
     }
 
     @Override protected void onStart() {
@@ -203,6 +175,8 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(phoneChanged, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(phoneChanged, filter);
         registered = true;
+        work.attach(this); showWork(); reloadData();
+        if (interruptedOperation) toast("Previous update may have completed. Check the list before saving again.");
         uiHandler.postDelayed(agePhoneSnapshot, 60_000L);
         try { PhoneSync.requestSnapshot(this); }
         catch (Exception e) { phoneNotice = "Phone refresh unavailable."; }
@@ -214,6 +188,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onStop() {
+        work.detach(this);
         uiHandler.removeCallbacks(agePhoneSnapshot);
         uiHandler.removeCallbacks(expireComplicationScroll);
         complicationScrollPending = false;
@@ -227,13 +202,17 @@ public class MainActivity extends Activity {
         out.putInt("month", month); out.putInt("day", day); out.putBoolean("hasDate", hasDate);
         out.putBoolean("sound", sound); out.putBoolean("vibrate", vibrate); out.putString("label", label);
         out.putBoolean("createOnPhone", createOnPhone);
-        out.putString("draftCreateId", draftCreateId);
+        out.putString("draftCreateId", work.draftRequestId.isEmpty() ? draftCreateId : work.draftRequestId);
         out.putLong("editingId", editingId); out.putString("editingOriginal", editingOriginal);
         out.putString("editingTarget", editingTarget); out.putBoolean("dateChanged", dateChanged);
         out.putString("chosenDate", chosenDate);
+        out.putBoolean("operationActive", work.phase != null || interruptedOperation);
+        out.putInt("listScroll", scroll != null && renderedListAvailable && !restoringListScroll && scroll.isLaidOut()
+            ? scroll.getScrollY() : savedListScroll);
     }
 
     @Override public void onBackPressed() {
+        if (work.busy()) return;
         if (page == 2) { page = 1; render(); }
         else if (page == 1) {
             if (editingId > 0 && editChanged()) {
@@ -260,34 +239,21 @@ public class MainActivity extends Activity {
     // Data Layer discovery and identical snapshot publications are advisory;
     // they must not replace the list view, reset focus, or interrupt a gesture.
     private String listStateKey() {
-        try {
-            JSONObject cache = snapshot(); long updated = cache.optLong("updatedAt", 0);
-            long age = System.currentTimeMillis() - updated;
-            JSONObject creation = PhoneSync.pendingCreate(this), mutation = PhoneSync.pendingMutation(this);
-            // Both complete row arrays include snoozedUntil, so pending snooze
-            // changes redraw the list without adding revisions or timestamps.
-            return new JSONObject().put("fallback",AlarmStore.phoneFallbackAlarms(this)).put("snoozeRequests",AlarmStore.watchSnoozeRequests(this)).put("watch", AlarmStore.alarms(this))
-                .put("ringing", AlarmStore.active(this)).put("mirrors", new JSONArray(PhoneMirror.live(this)))
-                .put("alarms", cache.optJSONArray("alarms")).put("groups", cache.optJSONArray("groups"))
-                .put("connected", connected(cache)).put("fresh", updated > 0 && age >= 0 && age <= FRESH_MS)
-                .put("pending", new JSONArray(new java.util.TreeSet<>(pending)))
-                .put("create", creation).put("busy", createBusy).put("createObserved", receiptObserved(creation, cache))
-                .put("mutation", mutation).put("mutationBusy", mutationBusy).put("mutationObserved", receiptObserved(mutation, cache))
-                .put("mutationReplaced", mutation != null && !cache.optString("epoch", "").isEmpty()
-                    && !mutation.optString("epoch", "").equals(cache.optString("epoch", "")))
-                .put("notice", phoneNotice).put("permission", AlarmStore.accessProblem(this))
-                .toString();
-        } catch (Exception e) { return "unavailable:" + e.getClass().getName() + ":" + phoneNotice; }
+        return data.key + ":" + phoneNotice;
     }
     private void renderListIfChanged() {
-        if (page == 0 && (renderedPage != 0 || !listStateKey().equals(renderedListState))) render();
+        reloadData();
     }
     private void render() {
-        final int oldScroll = scroll != null && page == renderedPage ? scroll.getScrollY() : 0;
+        if (scroll != null && renderedPage == 0 && renderedListAvailable && !restoringListScroll && scroll.isLaidOut())
+            savedListScroll = scroll.getScrollY();
+        final int oldScroll = page == 0 ? savedListScroll : 0;
         complicationScrollKey = page == 0 && complicationScrollPending ? nextKnownAlarmKey() : null;
         complicationScrollRow = null;
         if (page == 0) renderedListState = listStateKey();
         renderedPage = page;
+        renderedListAvailable = page == 0 && data.available;
+        restoringListScroll = false;
         getWindow().getDecorView().setSystemUiVisibility(page == 0 ? 0 :
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
             View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_FULLSCREEN |
@@ -313,7 +279,11 @@ public class MainActivity extends Activity {
             }
         });
         swipeRoot = root;
-        setContentView(root);
+        windowRoot = new android.widget.FrameLayout(this);
+        windowRoot.addView(root);
+        setContentView(windowRoot);
+        progress = null;
+        showWork();
         if (page == 0) list(); else if (page == 1) timePage(); else optionsPage();
         if (scroll != null && complicationScrollPending && complicationScrollRow != null) {
             final ScrollView listScroll = scroll;
@@ -329,9 +299,188 @@ public class MainActivity extends Activity {
                     return true;
                 }
             });
-        } else if (oldScroll > 0 && scroll != null && !complicationScrollPending) {
+        } else if (oldScroll > 0 && scroll != null && data.available && !complicationScrollPending) {
             final ScrollView listScroll = scroll;
-            listScroll.post(() -> { if (scroll == listScroll && !complicationScrollPending) listScroll.scrollTo(0, oldScroll); });
+            restoringListScroll = true;
+            listScroll.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+                @Override public boolean onPreDraw() {
+                    if (listScroll.getViewTreeObserver().isAlive()) listScroll.getViewTreeObserver().removeOnPreDrawListener(this);
+                    if (scroll == listScroll && !complicationScrollPending) {
+                        listScroll.scrollTo(0, oldScroll); restoringListScroll = false;
+                    }
+                    return true;
+                }
+            });
+        }
+    }
+    void workChanged() { showWork(); if (!work.busy()) reloadData(); }
+    void showWork() {
+        if (windowRoot == null) return;
+        if (progress != null) { windowRoot.removeView(progress); progress = null; }
+        String phase = work.visiblePhase();
+        if (phase == null) {
+            if (swipeRoot != null) { swipeRoot.setSwipeable(true); swipeRoot.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO); }
+            return;
+        }
+        swipeRoot.setSwipeable(false);
+        swipeRoot.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        LinearLayout shield = column(); shield.setGravity(Gravity.CENTER);
+        shield.setPadding(dp(36), dp(28), dp(36), dp(28));
+        shield.setBackgroundColor(0xbb000000); shield.setClickable(true); shield.setFocusable(true);
+        shield.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
+        shield.addView(new android.widget.ProgressBar(this), new LinearLayout.LayoutParams(dp(40), dp(40)));
+        TextView message = text(phase, 15, WHITE, true); message.setGravity(Gravity.CENTER);
+        message.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(-1, -2); mp.topMargin = dp(12);
+        shield.addView(message, mp);
+        windowRoot.addView(shield, new android.widget.FrameLayout.LayoutParams(-1, -1)); progress = shield;
+        shield.setFocusableInTouchMode(true); shield.requestFocus();
+    }
+    void acceptWorkData(WatchUiData fresh) { dataGeneration++; data = fresh; }
+    private void reloadData() {
+        if (loading) { reloadAgain = true; return; }
+        loading = true;
+        final long generation = dataGeneration;
+        Context app = getApplicationContext();
+        WatchUiWork.IO.execute(() -> {
+            WatchUiData fresh;
+            try { fresh = WatchUiData.read(app); }
+            catch (Exception unavailable) { fresh = new WatchUiData(); fresh.key = "unavailable"; }
+            final WatchUiData loaded = fresh;
+            uiHandler.post(() -> {
+                loading = false;
+                if (!isDestroyed() && generation == dataGeneration) {
+                    data = loaded;
+                    if (!data.available) phoneNotice = "Alarm state unavailable; no new action is safe. Reopen to retry.";
+
+                    if (registered && !work.busy()) {
+                        if (page == 0 && (renderedPage != 0 || !listStateKey().equals(renderedListState))) render();
+                        else if (page == 2 && createOnPhone && !draftCreateStatus().equals(renderedCreateStatus)) render();
+                    }
+                }
+                if (reloadAgain) { reloadAgain = false; reloadData(); }
+
+            });
+        });
+    }
+    interface DiskAction { JSONObject run(Context app) throws Exception; }
+    private void diskAction(DiskAction action, boolean leaveEditor, boolean confirm) {
+        if (!work.begin("Updating watch storage…")) return;
+        WatchUiWork operation = work; Context app = getApplicationContext();
+        WatchUiWork.IO.execute(() -> {
+            try {
+                JSONObject saved = action.run(app);
+                operation.finish(a -> {
+                    if (leaveEditor) a.page = 0;
+                    a.render();
+                    if (confirm) {
+                        JSONObject current = saved == null ? null : AlarmStore.find(a.data.alarms, saved.optLong("id", -1));
+                        a.showAlarmConfirmation(current, false);
+                    }
+                });
+            } catch (Exception failure) {
+                String message = AlarmStore.message(failure);
+                operation.finish(a -> { a.render(); a.toast(message); });
+            }
+        });
+    }
+    interface PhoneAction { void run(Context app, WatchUiWork operation) throws Exception; }
+    private void startPhoneOperation(PhoneAction action) { startPhoneOperation("Updating sync storage…", action); }
+    private void startPhoneOperation(String phase, PhoneAction action) {
+        if (!work.begin(phase)) return;
+        WatchUiWork operation = work; Context app = getApplicationContext();
+        WatchUiWork.IO.execute(() -> {
+            try {
+                action.run(app, operation);
+                uiHandler.post(operation::syncing);
+            } catch (Exception failure) {
+                operation.finish(a -> { a.phoneNotice = "Phone result unknown; check the phone before trying again."; a.render(); a.toast(a.phoneNotice); });
+            }
+        });
+    }
+    private void clearPhoneStatus(boolean creation, String request) {
+        if (!work.begin("Updating sync storage…")) return;
+        WatchUiWork operation = work; Context app = getApplicationContext();
+        WatchUiWork.IO.execute(() -> {
+            try {
+                boolean cleared = creation ? PhoneSync.forgetCreate(app, request) : PhoneSync.forgetMutation(app, request);
+                operation.finish(a -> {
+                    a.phoneNotice = cleared ? "Local request status cleared; check the phone before another change."
+                        : "Request still being checked; try later.";
+                    a.render(); a.toast(a.phoneNotice);
+                });
+            } catch (Exception unavailable) {
+                operation.finish(a -> { a.render(); a.toast("Local request status unavailable; check the phone"); });
+            }
+        });
+    }
+    private void refreshPhone() {
+        long previous = snapshot().optLong("updatedAt", 0);
+        startPhoneOperation("Synchronizing with phone…", (app, op) -> {
+            PhoneSync.requestSnapshot(app);
+            awaitPhone(op, app, "", -1, 0, null, false, false, previous,
+                android.os.SystemClock.elapsedRealtime() + 25_000L);
+        });
+    }
+    private void phoneResult(WatchUiWork operation, String status, long id, long revision, String epoch, boolean closeEditor) {
+        Context app = getApplicationContext();
+        if (!"created".equals(status) && !"committed".equals(status)) {
+            operation.finish(a -> {
+                if (!operation.draftRequestId.isEmpty()) a.draftCreateId = operation.draftRequestId;
+                a.phoneNotice = "not_sent".equals(status) ? "Request not sent. Check the connection and previous request."
+                    : "Phone result unconfirmed; check the phone before trying again. It may already have changed.";
+                a.render(); a.toast(a.phoneNotice);
+            });
+            return;
+        }
+        WatchUiWork.IO.execute(() -> {
+            try {
+                String ownerEpoch = epoch;
+                if (ownerEpoch.isEmpty()) {
+                    JSONObject receipt = "created".equals(status) ? PhoneSync.pendingCreate(app) : PhoneSync.pendingMutation(app);
+                    if (receipt != null) ownerEpoch = receipt.optString("epoch");
+                }
+                PhoneSync.requestSnapshot(app);
+                awaitPhone(operation, app, ownerEpoch, revision, id, null, id > 0, closeEditor, -1,
+                    android.os.SystemClock.elapsedRealtime() + 15_000L);
+            } catch (Exception unavailable) {
+                operation.finish(a -> { a.phoneNotice = "Phone acknowledged; local confirmation unavailable. Check the phone."; a.render(); a.toast(a.phoneNotice); });
+            }
+        });
+    }
+    private static void awaitPhone(WatchUiWork operation, Context app, String epoch, long revision,
+            long id, Boolean expected, boolean confirm, boolean closeEditor, long updatedAfter, long deadline) {
+        // Runs on IO. Poll only accepted snapshots; never replay a mutation on timeout.
+        JSONObject snapshot;
+        try { synchronized (PhoneSync.class) { snapshot = new JSONObject(PhoneSync.cached(app).toString()); } }
+        catch (Exception unavailable) { snapshot = new JSONObject(); }
+        boolean matched = updatedAfter >= 0 ? snapshot.optLong("updatedAt") > updatedAfter
+            : !epoch.isEmpty() && epoch.equals(snapshot.optString("epoch")) && snapshot.optLong("revision", -1) >= revision;
+        JSONObject row = null; JSONArray rows = snapshot.optJSONArray("alarms");
+        if (rows != null) for (int i = 0; i < rows.length(); i++) {
+            JSONObject candidate = rows.optJSONObject(i);
+            if (candidate != null && candidate.optLong("id") == id) { row = candidate; break; }
+        }
+        if (expected != null) matched &= row != null && row.optBoolean("enabled") == expected;
+        if (matched || android.os.SystemClock.elapsedRealtime() >= deadline) {
+            final boolean observed = matched;
+            operation.finish(a -> {
+                if (closeEditor) a.page = 0;
+                a.phoneNotice = observed ? "Phone list updated." : updatedAfter >= 0
+                    ? "Phone refresh not confirmed; cached state may be stale."
+                    : "Phone acknowledged the change; updated list not confirmed. Check the phone before retrying.";
+                a.render();
+                JSONObject current = null;
+                JSONObject latest = a.snapshot(); JSONArray latestRows = latest.optJSONArray("alarms");
+                if (observed && confirm && epoch.equals(latest.optString("epoch"))
+                        && latest.optLong("revision", -1) >= revision && latestRows != null)
+                    current = AlarmStore.find(latestRows, id);
+                if (current != null && current.optBoolean("enabled")) a.showAlarmConfirmation(current, true);
+                else a.toast(a.phoneNotice);
+            });
+        } else {
+            new Handler(Looper.getMainLooper()).postDelayed(() -> WatchUiWork.IO.execute(() ->
+                awaitPhone(operation, app, epoch, revision, id, expected, confirm, closeEditor, updatedAfter, deadline)), 400L);
         }
     }
     private void title(String s) { TextView t = text(s, 24, WHITE, true); t.setGravity(Gravity.CENTER); add(t, 0); }
@@ -340,29 +489,16 @@ public class MainActivity extends Activity {
     private Button button(String text, int color, Runnable action) {
         Button b = new Button(this); b.setText(text); b.setAllCaps(false); b.setTextSize(14);
         b.setTextColor(WHITE); b.setMinHeight(dp(48)); b.setBackground(shape(color, 28));
-        b.setOnClickListener(v -> action.run()); return b;
+        b.setOnClickListener(v -> { if (!work.busy() && data.available) action.run(); }); return b;
     }
     private void list() {
         title("Alarm");
+        if (!data.available) { note("unavailable".equals(data.key) ? "Alarm state unavailable; reopen to retry." : "Loading alarm state…"); return; }
         activeControls();
         permissions();
         section("Watch alarms");
         try {
-            JSONArray snoozes=AlarmStore.watchSnoozeRequests(this);
-            for(int i=0;i<snoozes.length();i++) {
-                JSONObject request=snoozes.getJSONObject(i);
-                if("expired".equals(request.optString("state"))) note("Snooze missed while watch unavailable; check both devices.");
-                if("pending".equals(request.optString("state"))) note(request.has("receipt")?
-                    "Phone snooze committed; watch fallback registration pending. Original watch ring retained.":"Phone snooze unconfirmed; watch-only recovery pending.");
-                else if("branched".equals(request.optString("state"))) {
-                    JSONObject branch=AlarmStore.find(AlarmStore.alarms(this),request.optLong("branchId"));
-                    if(branch!=null&&branch.optBoolean("enabled")) note(request.has("receipt")?
-                        "Phone also committed this snooze. Independent watch snooze retained; possible duplicates.":"Watch-only snooze; phone result unknown. Possible duplicates.");
-                }
-            }
-        } catch(Exception unavailable) { note("Snooze ownership state unavailable"); }
-        try {
-            JSONArray alarms = AlarmStore.alarms(this);
+            JSONArray alarms = data.alarms;
             if (alarms.length() == 0) note("No watch alarms yet");
             for (int i = 0; i < alarms.length(); i++) {
                 JSONObject a = alarms.optJSONObject(i); if (a != null) add(alarmRow(a, false), 8);
@@ -373,17 +509,17 @@ public class MainActivity extends Activity {
         Button createPhone = button("+  Add phone alarm", 0xff3d465d, () -> beginCreate(true));
         createPhone.setEnabled(!createBlocked());
         add(createPhone, 10);
-        createStatus();
-        mutationStatus();
         phoneList();
+        syncStatus();
+        if (connected(snapshot())) add(button("Refresh phone", CARD, this::refreshPhone), 10);
         add(button("Do Not Disturb", CARD, this::dndHelp), 20);
         add(button("Test double shake", CARD, () -> startActivity(new Intent(this, ShakeTestActivity.class))), 20);
         add(button("Check for updates", CARD, () -> UpdateChecker.show(this, "watch")), 20);
     }
 
     private void activeControls() {
-        JSONArray local = AlarmStore.active(this);
-        java.util.List<JSONObject> mirrors = PhoneMirror.live(this);
+        JSONArray local = data.active;
+        java.util.List<JSONObject> mirrors = data.mirrors;
         if (local.length() == 0 && mirrors.isEmpty()) return;
         section("Ringing now");
         for (int i = 0; i < local.length(); i++) {
@@ -395,9 +531,7 @@ public class MainActivity extends Activity {
             long id = alarm.optLong("id");
             String token = alarm.optJSONObject("_active").optString("token");
             add(button(text, 0xff4b287f, () -> {
-                JSONObject current = AlarmStore.active(this, id, token);
-                if (current != null) startActivity(AlarmNotifications.alertIntent(this, current));
-                else renderListIfChanged();
+                openActive(id, token, false);
             }), 8);
         }
         for (JSONObject alarm : mirrors) {
@@ -405,13 +539,21 @@ public class MainActivity extends Activity {
             String text = "Phone alarm" + (label.isEmpty() ? "" : ": " + label);
             long id = alarm.optLong("id"); String token = alarm.optString("token");
             add(button(text, 0xff4b287f, () -> {
-                JSONObject current = PhoneMirror.current(this, id, token);
-                if (current != null) startActivity(PhoneMirror.openIntent(this, current));
-                else renderListIfChanged();
+                openActive(id, token, true);
             }), 8);
         }
     }
 
+    private void openActive(long id, String token, boolean mirror) {
+        if (!work.begin("Opening ringing alarm…")) return;
+        WatchUiWork operation = work; Context app = getApplicationContext();
+        WatchUiWork.IO.execute(() -> {
+            try {
+                JSONObject current = mirror ? PhoneMirror.current(app, id, token) : AlarmStore.active(app, id, token);
+                operation.finish(a -> { if (current != null) a.startActivity(mirror ? PhoneMirror.openIntent(a, current) : AlarmNotifications.alertIntent(a, current)); });
+            } catch (Exception unavailable) { operation.finish(a -> a.toast("Ringing state unavailable; reopen controls")); }
+        });
+    }
     private void dndHelp() {
         NotificationManager nm = getSystemService(NotificationManager.class);
         boolean granted = nm != null && nm.isNotificationPolicyAccessGranted();
@@ -443,16 +585,16 @@ public class MainActivity extends Activity {
 
     private boolean createBlocked() {
         try {
-            JSONObject pendingCreate = PhoneSync.pendingCreate(this);
-            return createBusy || (pendingCreate != null && (!"created".equals(pendingCreate.optString("status"))
+            JSONObject pendingCreate = data.creation;
+            return pendingCreate != null && (!"created".equals(pendingCreate.optString("status"))
                     || (page != 0 && createOnPhone && !draftCreateId.isEmpty()
-                    && draftCreateId.equals(pendingCreate.optString("requestId")))));
+                    && draftCreateId.equals(pendingCreate.optString("requestId"))));
         } catch (RuntimeException unreadable) { return true; }
     }
 
     private String draftCreateStatus() {
         try {
-            JSONObject pendingCreate = PhoneSync.pendingCreate(this);
+            JSONObject pendingCreate = data.creation;
             return pendingCreate != null && draftCreateId.equals(pendingCreate.optString("requestId"))
                     ? pendingCreate.optString("status", "unknown") : "";
         } catch (RuntimeException unreadable) { return "unavailable"; }
@@ -460,7 +602,7 @@ public class MainActivity extends Activity {
 
     private void createStatus() {
         JSONObject pendingCreate;
-        try { pendingCreate = PhoneSync.pendingCreate(this); }
+        try { pendingCreate = data.creation; }
         catch (RuntimeException unreadable) { note("Phone creation state unavailable; new phone alarms are blocked."); return; }
         if (pendingCreate == null) return;
         if ("created".equals(pendingCreate.optString("status"))) {
@@ -484,26 +626,18 @@ public class MainActivity extends Activity {
                 .setMessage("The alarm may already exist on the phone. Creating another could duplicate it. Check the phone first.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Clear", (d, w) -> {
-                    if (PhoneSync.forgetCreate(this, requestId)) phoneNotice = "Unconfirmed request cleared. Check the phone before creating another.";
-                    else phoneNotice = "Request is still being checked; try again later.";
-                    render();
+                    clearPhoneStatus(true, requestId);
                 }).show();
         }), 8);
     }
 
     private void checkCreateResult() {
-        if (createBusy) { toast("Phone request is still in progress"); return; }
-        createBusy = true; phoneNotice = "Checking the previous phone request…"; render();
-        PhoneSync.reconcileCreate(getApplicationContext(), (status, requestId, alarmId, revision) -> {
-            createBusy = false;
-            phoneNotice = "created".equals(status) ? "Phone confirmed the alarm."
-                    : "Still unconfirmed. Check the phone; it may already exist.";
-            if (!isFinishing() && !isDestroyed() && page == 0) render();
-        });
+        startPhoneOperation("Synchronizing with phone…", (app, op) -> PhoneSync.reconcileCreate(app, (status, request, alarm, revision) ->
+            phoneResult(op, status, alarm, revision, "", false)));
     }
 
     private boolean mutationBlocked() {
-        try { return mutationBusy || PhoneSync.pendingMutation(this) != null; }
+        try { return data.mutation != null; }
         catch (RuntimeException unreadable) { return true; }
     }
     private boolean receiptObserved(JSONObject receipt, JSONObject cache) {
@@ -513,7 +647,7 @@ public class MainActivity extends Activity {
     }
     private void mutationStatus() {
         JSONObject p;
-        try { p = PhoneSync.pendingMutation(this); }
+        try { p = data.mutation; }
         catch (RuntimeException e) { note("Phone change state unavailable; edits and deletions are blocked."); return; }
         if (p == null) return;
         String request = p.optString("requestId", "");
@@ -525,18 +659,15 @@ public class MainActivity extends Activity {
             if (seen || phoneReplaced) {
                 // Only a positively confirmed change whose snapshot is observed (or
                 // whose phone identity changed) may be cleared automatically.
-                if (!mutationBusy && PhoneSync.forgetMutation(this, request)) return;
+                // Cleared only by an explicit IO action; rendering never writes disk.
                 note("Phone confirmed the change; clearing its local status is pending.");
-                if (!mutationBusy) add(button("Clear confirmed change", CARD, () -> {
-                    if (!PhoneSync.forgetMutation(this, request)) toast("Change is still being checked");
-                    render();
+                add(button("Clear confirmed change", CARD, () -> {
+                    clearPhoneStatus(false, request);
                 }), 8);
                 return;
             }
             note("Phone confirmed the change; waiting for the updated list.");
-            add(button("Refresh phone", CARD, () -> {
-                try { PhoneSync.requestSnapshot(this); } catch (Exception e) { toast("Phone refresh unavailable"); }
-            }), 8);
+            add(button("Refresh phone", CARD, this::refreshPhone), 8);
             return;
         }
         note("capacity".equals(p.optString("status"))
@@ -547,32 +678,14 @@ public class MainActivity extends Activity {
             .setTitle("Clear unconfirmed change?")
             .setMessage("The phone may already have changed or deleted the alarm. Check the phone before making another change.")
             .setNegativeButton("Cancel", null).setPositiveButton("Clear", (d, w) -> {
-                if (!PhoneSync.forgetMutation(this, request)) toast("Change is still being checked");
-                else phoneNotice = "Unconfirmed change cleared; check the phone.";
-                render();
+                clearPhoneStatus(false, request);
             }).show()), 8);
     }
     private void checkMutationResult() {
-        if (mutationBusy) { toast("Phone request is still in progress"); return; }
-        mutationBusy = true; phoneNotice = "Checking the phone change…"; render();
-        PhoneSync.reconcileMutation(getApplicationContext(), (status, request, alarm, revision) ->
-                finishPhoneMutation(status, request, false));
+        startPhoneOperation("Synchronizing with phone…", (app, op) -> PhoneSync.reconcileMutation(app, (status, request, alarm, revision) ->
+            phoneResult(op, status, alarm, revision, "", false)));
     }
-    private void finishPhoneMutation(String status, String request, boolean editing) {
-        mutationBusy = false;
-        phoneNotice = "committed".equals(status) ? "Phone confirmed the change."
-                : "capacity".equals(status) ? "Phone receipt storage full; check the phone."
-                : "not_sent".equals(status) ? "Change not sent. Refresh and reopen the alarm."
-                : "Phone change not confirmed. Check the phone before trying again.";
-        if (isFinishing() || isDestroyed()) return;
-        if (editing && !"not_sent".equals(status)) {
-            try {
-                if (page > 0 && request.equals(new JSONObject(editingTarget).optString("requestId"))) page = 0;
-            } catch (Exception ignored) { }
-        }
-        render();
-        if (!editing || !"committed".equals(status)) toast(phoneNotice);
-    }
+
 
     private void beginCreate(boolean phone) {
         Calendar c = Calendar.getInstance();
@@ -580,13 +693,14 @@ public class MainActivity extends Activity {
         month = c.get(Calendar.MONTH) + 1; day = c.get(Calendar.DAY_OF_MONTH);
         hasDate = false; sound = false; vibrate = true; label = "";
         editingId = -1; editingOriginal = ""; editingTarget = ""; dateChanged = false; chosenDate = "";
-        draftCreateId = "";
+        draftCreateId = ""; work.draftRequestId = ""; interruptedOperation = false;
         createOnPhone = phone; page = 1; render();
     }
 
     private void beginEdit(JSONObject alarm, boolean phone, JSONObject target) {
         try {
             if (phone && (target == null || mutationBlocked())) { toast("Check the previous phone change first"); return; }
+            interruptedOperation = false;
             editingId = alarm.getLong("id"); editingOriginal = alarm.toString();
             editingTarget = phone ? target.toString() : "";
             hour = alarm.getInt("hour"); minute = alarm.getInt("minute");
@@ -612,7 +726,7 @@ public class MainActivity extends Activity {
 
     private void permissions() {
         String problem;
-        try { problem = AlarmStore.accessProblem(this); }
+        try { problem = data.accessProblem; }
         catch (Exception e) { problem = "Alarm access could not be checked"; }
         if (problem != null) {
             TextView warning = text(problem, 12, RED, false); add(warning, 12);
@@ -627,7 +741,6 @@ public class MainActivity extends Activity {
         }
 
         try {
-            PhoneMirror.channels(this);
             NotificationManager nm = getSystemService(NotificationManager.class);
             android.app.NotificationChannel mirror = nm == null ? null : nm.getNotificationChannel(PhoneMirror.CHANNEL);
             if (mirror == null || mirror.getImportance() < NotificationManager.IMPORTANCE_HIGH) {
@@ -688,18 +801,14 @@ public class MainActivity extends Activity {
         final long id = a.optLong("id", -1); final boolean old = a.optBoolean("enabled", false);
         Switch toggle = new Switch(this); toggle.setMinWidth(dp(48)); toggle.setMinHeight(dp(48));
         toggle.setChecked(old); toggle.setContentDescription((phone ? "Phone" : "Watch") + " alarm " + time.getText() + (l.isEmpty() ? "" : ", " + l));
-        if (phone && (id <= 0 || !connected(snapshot()) || pending.contains(id))) toggle.setEnabled(false);
+        if (phone && (id <= 0 || !connected(snapshot()))) toggle.setEnabled(false);
         toggle.setOnCheckedChangeListener((button, checked) -> {
+            if (work.busy()) { button.setOnCheckedChangeListener(null); button.setChecked(old); return; }
             if (phone) {
                 button.setOnCheckedChangeListener(null); button.setChecked(old);
                 phoneToggle(id, checked);
             } else {
-                try {
-                    JSONObject saved = AlarmStore.saveAlarm(this, new JSONObject().put("id", id).put("enabled", checked));
-                    if (checked) showAlarmConfirmation(saved, false);
-                }
-                catch (Exception e) { toast(AlarmStore.message(e)); }
-                render();
+                diskAction(app -> AlarmStore.saveAlarm(app, new JSONObject().put("id", id).put("enabled", checked)), false, checked);
             }
         });
         row.addView(toggle);
@@ -814,6 +923,7 @@ public class MainActivity extends Activity {
         openAlarmRow(displayed, phone, actions, false);
     }
     private void openAlarmRow(JSONObject displayed, boolean phone, boolean actions, boolean directDelete) {
+        if (work.busy() || !data.available) return;
         if (!phone) {
             if (directDelete) confirmDelete(displayed, false, null);
             else if (actions) alarmActions(displayed, false, null);
@@ -823,15 +933,19 @@ public class MainActivity extends Activity {
         // A no-op phone publication can advance the revision without redrawing
         // this row. Resolve it at the moment of the tap, but only if the
         // displayed alarm still matches the authoritative cached fields.
-        JSONObject target = PhoneSync.captureMutationTarget(this, displayed.optLong("id", -1));
-        JSONObject current = target == null ? null : target.optJSONObject("alarm");
-        if (target == null || current == null || !sameEditableAlarm(displayed, current)) {
-            toast("Phone changed or disconnected; refresh the list"); renderListIfChanged(); return;
-        }
         if (mutationBlocked()) { toast("Check the previous phone change first"); return; }
-        if (directDelete) confirmDelete(current, true, target);
-        else if (actions) alarmActions(current, true, target);
-        else beginEdit(current, true, target);
+        if (!work.begin("Reading phone alarm…")) return;
+        WatchUiWork operation = work; Context app = getApplicationContext();
+        WatchUiWork.IO.execute(() -> {
+            JSONObject target = PhoneSync.captureMutationTarget(app, displayed.optLong("id", -1));
+            JSONObject current = target == null ? null : target.optJSONObject("alarm");
+            operation.finish(a -> {
+                if (current == null || !sameEditableAlarm(displayed, current)) { a.toast("Phone changed or disconnected; refresh the list"); return; }
+                if (directDelete) a.confirmDelete(current, true, target);
+                else if (actions) a.alarmActions(current, true, target);
+                else a.beginEdit(current, true, target);
+            });
+        });
     }
     private void alarmActions(JSONObject alarm, boolean phone, JSONObject target) {
         new AlertDialog.Builder(this).setTitle(phone ? "Phone alarm" : "Watch alarm")
@@ -843,20 +957,20 @@ public class MainActivity extends Activity {
                     : "Delete this watch alarm? This also stops any active ring or snooze.")
             .setNegativeButton("Cancel", null).setPositiveButton("Delete", (d, w) -> {
                 if (phone) deletePhoneAlarm(target);
-                else { try { deleteLocalIfUnchanged(alarm); } catch (Exception e) { toast(AlarmStore.message(e)); } render(); }
+                else diskAction(app -> { deleteLocalIfUnchanged(app, alarm); return null; }, false, false);
             }).show();
     }
-    private void deleteLocalIfUnchanged(JSONObject expected) throws Exception {
+    private static void deleteLocalIfUnchanged(Context app, JSONObject expected) throws Exception {
         long id = expected.optLong("id", -1);
         synchronized (AlarmStore.class) {
-            JSONArray alarms = AlarmStore.alarms(this); JSONObject current = null;
+            JSONArray alarms = AlarmStore.alarms(app); JSONObject current = null;
             for (int i = 0; i < alarms.length(); i++) {
                 JSONObject a = alarms.optJSONObject(i);
                 if (a != null && a.optLong("id", -1) == id) { current = a; break; }
             }
             if (current == null || !sameEditableAlarm(expected, current))
                 throw new IllegalStateException("Alarm changed; return to the list and reopen it");
-            AlarmStore.deleteAlarm(this, id);
+            AlarmStore.deleteAlarm(app, id);
         }
     }
     private String schedule(JSONObject a) {
@@ -870,22 +984,38 @@ public class MainActivity extends Activity {
         return s.length() == 0 ? "Schedule unavailable" : s.toString();
     }
     private JSONObject snapshot() {
-        try { JSONObject o = PhoneSync.cached(this); return o == null ? new JSONObject() : o; }
-        catch (Exception e) { return new JSONObject(); }
+        return data.phone;
     }
     private boolean connected(JSONObject o) { return o.optBoolean("connected", false); }
-    private void phoneList() {
+    private void syncStatus() {
+        try {
+            JSONArray snoozes=data.snoozes;
+            for(int i=0;i<snoozes.length();i++) {
+                JSONObject request=snoozes.getJSONObject(i);
+                if("expired".equals(request.optString("state"))) note("Snooze missed while watch unavailable; check both devices.");
+                if("pending".equals(request.optString("state"))) note(request.has("receipt")?
+                    "Phone snooze committed; watch fallback registration pending. Original watch ring retained.":"Phone snooze unconfirmed; watch-only recovery pending.");
+                else if("branched".equals(request.optString("state"))) {
+                    JSONObject branch=AlarmStore.find(data.alarms,request.optLong("branchId"));
+                    if(branch!=null&&branch.optBoolean("enabled")) note(request.has("receipt")?
+                        "Phone also committed this snooze. Independent watch snooze retained; possible duplicates.":"Watch-only snooze; phone result unknown. Possible duplicates.");
+                }
+            }
+        } catch(Exception unavailable) { note("Snooze ownership state unavailable"); }
+        createStatus();
+        mutationStatus();
         JSONObject cache = snapshot(); boolean online = connected(cache); long updated = cache.optLong("updatedAt", 0);
         long age = System.currentTimeMillis() - updated;
-        String fallbackProblem = PhoneFallback.problem(this);
+        String fallbackProblem = data.fallbackProblem;
         if (!fallbackProblem.isEmpty()) note("Watch phone-alarm fallback problem: " + fallbackProblem);
-        else note("Watch schedules phone alarms independently from the last snapshot, even offline. Changes may be stale; both devices may ring. A matching phone snooze can synchronize when connected.");
         if (!online) note("Phone unavailable. Cached alarms may be stale; controls are disabled.");
         else if (updated <= 0 || age < 0 || age > FRESH_MS) note("Phone connected · snapshot is stale or not yet available.");
-
         if (!phoneNotice.isEmpty()) note(phoneNotice);
+    }
+    private void phoneList() {
+        JSONObject cache = snapshot(); boolean online = connected(cache);
         WatchSchedule.View committed;
-        try { committed=WatchSchedule.read(this,cache); }
+        try { committed=data.schedule; }
         catch(Exception unavailable) { note("Committed watch fallback state unavailable"); return; }
         for(int i=0;i<committed.retained.length();i++) {
             JSONObject row=committed.retained.optJSONObject(i);
@@ -897,94 +1027,38 @@ public class MainActivity extends Activity {
         }
         JSONArray alarms = committed.phone, groups = cache.optJSONArray("groups");
         if (alarms == null) { note(online ? "Waiting for phone alarms…" : "No cached phone alarms."); return; }
-        Set<Long> shown = new HashSet<>();
         if (groups != null) for (int i = 0; i < groups.length(); i++) {
             JSONObject g = groups.optJSONObject(i); if (g == null || g.optLong("id", -1) <= 0) continue;
             long groupId = g.optLong("id");
             TextView heading = text(g.optString("name", "Group"), 14, BLUE, true); add(heading, 14);
-            int count = 0;
-            for (int j = 0; j < alarms.length(); j++) {
-                JSONObject a = alarms.optJSONObject(j);
-                if (a != null && !a.isNull("groupId") && a.optLong("groupId", -1) == groupId) {
-                    add(alarmRow(a, true), 8); shown.add(a.optLong("id", -1)); count++;
-                }
-            }
-            if (count == 0) note("No alarms in this group");
+            java.util.List<JSONObject> rows = data.grouped.get(groupId);
+            if (rows != null) for (JSONObject a : rows) add(alarmRow(a, true), 8);
+            if (rows == null || rows.isEmpty()) note("No alarms in this group");
         }
         int rest = 0;
-        for (int i = 0; i < alarms.length(); i++) {
-            JSONObject a = alarms.optJSONObject(i); if (a == null || shown.contains(a.optLong("id", -1))) continue;
+        for (JSONObject a : data.other) {
             if (rest++ == 0 && groups != null && groups.length() > 0) { TextView h = text("Other alarms", 14, BLUE, true); add(h, 14); }
             add(alarmRow(a, true), 8);
         }
         if (alarms.length() == 0 && (groups == null || groups.length() == 0)) note("No phone alarms in snapshot");
-        if (online) add(button("Refresh phone", CARD, () -> {
-            if (connected(snapshot())) {
-                try { awaitingAfter = snapshot().optLong("updatedAt", 0); if (awaitingAfter <= 0) awaitingAfter = 1;
-                    phoneNotice = "Refresh requested; waiting for phone."; PhoneSync.requestSnapshot(this); }
-                catch (Exception e) { phoneNotice = "Phone refresh unavailable."; }
-                render();
-            }
-            else { phoneNotice = "Phone unavailable; refresh not sent."; render(); }
-        }), 10);
     }
     private void phoneToggle(long id, boolean enabled) {
-        if (id <= 0 || !connected(snapshot())) { phoneNotice = "Phone unavailable; change not sent."; render(); return; }
-        try {
-            JSONObject command = new JSONObject().put("op", "setEnabled").put("id", id).put("enabled", enabled);
-            pending.add(id); pendingExpected.put(id, enabled); phoneNotice = "Change pending on phone…"; render();
+        if (id <= 0 || !connected(snapshot())) { toast("Phone unavailable; change not sent."); return; }
+        startPhoneOperation((app, op) -> {
             synchronized (PhoneSync.class) {
-            // Capture the same epoch and revision that command() will send.
-            JSONObject base = snapshot();
-            final long baseRevision = base.optLong("revision", -1);
-            final String epoch = base.optString("epoch", "");
-            PhoneSync.command(this, command, (ok, safeMessage) -> {
-                if (ok) {
-                    phoneNotice = "Phone accepted the request; awaiting a fresh snapshot.";
-                    awaitingAfter = snapshot().optLong("updatedAt", 0); if (awaitingAfter <= 0) awaitingAfter = 1;
-                    pendingRefresh.put(id, baseRevision);
-                    // The updated snapshot may arrive before the acknowledgement.
-                    reconcilePending();
-                    if (enabled) queuePhoneConfirmation(id, epoch, baseRevision + 1);
-                    if (!pending.contains(id)) phoneNotice = "Phone alarm updated.";
-                    try { if (connected(snapshot())) PhoneSync.requestSnapshot(this); }
-                    catch (Exception e) { phoneNotice = "Phone accepted the request; refresh unavailable. Cached state may be stale."; }
-                    uiHandler.postDelayed(() -> {
-                        if (java.util.Objects.equals(pendingRefresh.get(id), baseRevision)) {
-                            pendingRefresh.remove(id); pendingExpected.remove(id); pending.remove(id);
-                            phoneNotice = "Phone accepted the change; the displayed snapshot may be stale. Refresh to confirm.";
-                            if (!isFinishing() && !isDestroyed() && page == 0) render();
-                        }
-                    }, 15_000L);
-                } else {
-                    pending.remove(id); pendingRefresh.remove(id); pendingExpected.remove(id);
-                    phoneNotice = "Phone change not confirmed" + (safeMessage == null || safeMessage.isEmpty() ? "." : ": " + safeMessage);
-                }
-                if (!isFinishing() && !isDestroyed() && page == 0) render();
-            });
+                JSONObject base = PhoneSync.cached(app);
+                long revision = base.optLong("revision", -1); String epoch = base.optString("epoch");
+                PhoneSync.command(app, new JSONObject().put("op", "setEnabled").put("id", id).put("enabled", enabled),
+                    (ok, safeMessage) -> {
+                        if (!ok) phoneResult(op, "unknown", id, revision + 1, epoch, false);
+                        else WatchUiWork.IO.execute(() -> awaitPhone(op, app, epoch, revision + 1, id, enabled,
+                            enabled, false, -1, android.os.SystemClock.elapsedRealtime() + 15_000L));
+                    });
             }
-        } catch (Exception e) { pending.remove(id); pendingRefresh.remove(id); pendingExpected.remove(id); phoneNotice = "Phone change could not be sent."; render(); }
+        });
     }
 
-    private void reconcilePending() {
-        JSONObject current = snapshot();
-        long revision = current.optLong("revision", -1);
-        JSONArray alarms = current.optJSONArray("alarms");
-        if (alarms == null) return;
-        java.util.Iterator<Map.Entry<Long, Long>> it = pendingRefresh.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<Long, Long> entry = it.next();
-            Boolean expected = pendingExpected.get(entry.getKey());
-            if (expected == null || revision <= entry.getValue()) continue;
-            for (int i = 0; i < alarms.length(); i++) {
-                JSONObject alarm = alarms.optJSONObject(i);
-                if (alarm != null && alarm.optLong("id", -1) == entry.getKey()
-                        && alarm.optBoolean("enabled") == expected) {
-                    pending.remove(entry.getKey()); pendingExpected.remove(entry.getKey()); it.remove(); break;
-                }
-            }
-        }
-    }
+
 
     private NumberPicker picker(int min, int max, int value, NumberPicker.OnValueChangeListener listener) {
         NumberPicker p = new NumberPicker(this); p.setMinValue(min); p.setMaxValue(max); p.setValue(value);
@@ -1024,8 +1098,8 @@ public class MainActivity extends Activity {
         compactPair(row2, soundButton, vibrationButton);
         content.addView(row2, new LinearLayout.LayoutParams(-1, 0, 1));
         renderedCreateStatus = draftCreateStatus();
-        boolean blocked = createOnPhone && (editingId <= 0 ? createBlocked() : mutationBlocked());
-        Button saveButton = button(blocked ? "Phone pending" : "Save", 0xff43557d, this::save);
+        boolean blocked = interruptedOperation || (createOnPhone && (editingId <= 0 ? createBlocked() : mutationBlocked()));
+        Button saveButton = button(interruptedOperation ? "Check list first" : blocked ? "Phone pending" : "Save", 0xff43557d, this::save);
         saveButton.setEnabled(!blocked); saveButton.setAlpha(blocked ? .5f : 1f);
         content.addView(saveButton, new LinearLayout.LayoutParams(-1, dp(48)));
     }
@@ -1115,6 +1189,7 @@ public class MainActivity extends Activity {
         throw new IllegalArgumentException("No future valid date");
     }
     private void save() {
+        if (interruptedOperation) { toast("Previous update may have completed. Return to the list and check before saving again."); return; }
         try {
             LocalDate date = hasDate && (editingId <= 0 || dateChanged) ? resolveDate() : null;
             if (date != null && !date.toString().equals(chosenDate))
@@ -1149,20 +1224,17 @@ public class MainActivity extends Activity {
             if (date != null) patch.put("days", new JSONArray());
         }
         if (createOnPhone) { savePhoneEdit(patch); return; }
-        JSONObject saved;
-        synchronized (AlarmStore.class) {
-            JSONArray alarms = AlarmStore.alarms(this); JSONObject current = null;
-            for (int i = 0; i < alarms.length(); i++) {
-                JSONObject a = alarms.optJSONObject(i);
-                if (a != null && a.optLong("id", -1) == editingId) { current = a; break; }
+        final long id = editingId;
+        diskAction(app -> {
+            synchronized (AlarmStore.class) {
+                JSONObject current = AlarmStore.find(AlarmStore.alarms(app), id);
+                if (current == null || !sameEditableAlarm(original, current))
+                    throw new IllegalStateException("Alarm changed; return to the list and reopen it");
+                return AlarmStore.saveAlarm(app, patch);
             }
-            if (current == null || !sameEditableAlarm(original, current))
-                throw new IllegalStateException("Alarm changed; return to the list and reopen it");
-            saved = AlarmStore.saveAlarm(this, patch);
-        }
-        page = 0; render(); showAlarmConfirmation(saved, false);
+        }, true, true);
     }
-    private boolean sameEditableAlarm(JSONObject a, JSONObject b) {
+    private static boolean sameEditableAlarm(JSONObject a, JSONObject b) {
         for (String key : new String[]{"hour", "minute", "label", "sound", "vibrate", "date", "days",
                 "enabled", "groupId", "snoozeEnabled", "snoozeMinutes", "snoozeCount", "vibrationPattern"})
             if (!String.valueOf(a.opt(key)).equals(String.valueOf(b.opt(key)))) return false;
@@ -1172,103 +1244,45 @@ public class MainActivity extends Activity {
         if (mutationBlocked()) { toast("Check the previous phone change first"); return; }
         JSONObject target = new JSONObject(editingTarget);
         JSONObject patch = new JSONObject(withId.toString()); patch.remove("id");
-        mutationBusy = true; render();
-        PhoneSync.editAlarm(getApplicationContext(), target, patch, (status, request, alarm, revision) -> {
-            finishPhoneMutation(status, request, true);
-            if ("committed".equals(status)) queuePhoneConfirmation(alarm, target.optString("epoch", ""), revision);
-        });
+        startPhoneOperation((app, op) -> PhoneSync.editAlarm(app, target, patch, (status, request, alarm, revision) ->
+            phoneResult(op, status, alarm, revision, target.optString("epoch"), true)));
     }
     private void deletePhoneAlarm(JSONObject target) {
         if (mutationBlocked()) { toast("Check the previous phone change first"); return; }
-        mutationBusy = true; phoneNotice = "Deleting on phone…"; render();
-        PhoneSync.deleteAlarm(getApplicationContext(), target, (status, request, alarm, revision) ->
-                finishPhoneMutation(status, request, false));
+        startPhoneOperation((app, op) -> PhoneSync.deleteAlarm(app, target, (status, request, alarm, revision) ->
+            phoneResult(op, status, 0, revision, target.optString("epoch"), false)));
     }
     private void saveOnPhone(LocalDate date) throws Exception {
         if (createBlocked()) { toast("Check the previous phone request first"); return; }
         String cleanLabel = label.trim();
         if (cleanLabel.length() > 200) { toast("Label is too long"); return; }
         JSONObject alarm = new JSONObject().put("hour", hour).put("minute", minute)
-                .put("label", cleanLabel).put("date", date == null ? JSONObject.NULL : date.toString())
-                .put("sound", sound).put("vibrate", vibrate);
-        JSONObject previous = PhoneSync.pendingCreate(this);
-        String oldRequest = previous == null ? "" : previous.optString("requestId", "");
-        createBusy = true;
-        PhoneSync.createAlarm(getApplicationContext(), alarm, (result, requestId, alarmId, revision) -> {
-            createBusy = false;
-            if ("created".equals(result)) {
-                phoneNotice = "Phone confirmed the alarm; updating the list.";
-                if (page == 2 && createOnPhone) page = 0;
-            } else if ("not_sent".equals(result)) {
-                phoneNotice = "Phone unavailable or request not sent. Check the connection and previous request.";
-            } else {
-                phoneNotice = "Phone alarm not confirmed; check the phone before trying again.";
-            }
-            if (!isFinishing() && !isDestroyed()) {
-                if (page == 0 || (page == 2 && createOnPhone)) render();
-                if ("created".equals(result)) {
-                    try {
-                        JSONObject receipt = PhoneSync.pendingCreate(this);
-                        if (receipt != null && requestId.equals(receipt.optString("requestId")))
-                            queuePhoneConfirmation(alarmId, receipt.optString("epoch", ""), revision);
-                        else toast(phoneNotice);
-                    } catch (RuntimeException ignored) { toast(phoneNotice); }
-                } else toast(phoneNotice);
-            }
+            .put("label", cleanLabel).put("date", date == null ? JSONObject.NULL : date.toString())
+            .put("sound", sound).put("vibrate", vibrate);
+        startPhoneOperation((app, op) -> {
+            JSONObject before = PhoneSync.pendingCreate(app);
+            String previous = before == null ? "" : before.optString("requestId");
+            PhoneSync.createAlarm(app, alarm, (status, request, id, revision) -> {
+                if (!request.isEmpty()) op.draftRequestId = request;
+                phoneResult(op, status, id, revision, "", true);
+            });
+            JSONObject after = PhoneSync.pendingCreate(app);
+            if (after != null && !previous.equals(after.optString("requestId"))) op.draftRequestId = after.optString("requestId");
         });
-        JSONObject current = PhoneSync.pendingCreate(this);
-        if (current != null && !oldRequest.equals(current.optString("requestId", "")))
-            draftCreateId = current.optString("requestId", "");
-        render();
     }
     private void saveResolved(LocalDate date) {
         try {
             JSONObject a = new JSONObject().put("hour", hour).put("minute", minute).put("label", label.trim())
                 .put("date", date == null ? JSONObject.NULL : date.toString()).put("days", new JSONArray())
                 .put("sound", sound).put("vibrate", vibrate).put("enabled", true).put("groupId", JSONObject.NULL);
-            JSONObject saved = AlarmStore.saveAlarm(this, a);
-            page = 0; render(); showAlarmConfirmation(saved, false);
+            diskAction(app -> AlarmStore.saveAlarm(app, a), true, true);
         } catch (Exception e) { toast(AlarmStore.message(e)); }
-    }
-    // Phone acknowledgements do not carry the committed trigger: wait for a
-    // matching, sufficiently recent snapshot, which can arrive before the ack.
-    private void queuePhoneConfirmation(long id, String epoch, long revision) {
-        if (isFinishing() || isDestroyed() || id <= 0 || epoch.isEmpty() || revision < 0) return;
-        PhoneConfirmation confirmation = new PhoneConfirmation(epoch, revision);
-        phoneConfirmations.put(id, confirmation);
-        reconcilePhoneConfirmations();
-        uiHandler.postDelayed(() -> {
-            if (phoneConfirmations.get(id) == confirmation) {
-                phoneConfirmations.remove(id);
-                if (registered && !isFinishing() && !isDestroyed())
-                    toast("Phone confirmed; next trigger unavailable. Check the alarm list.");
-            }
-        }, 15_000L);
-    }
-    private void reconcilePhoneConfirmations() {
-        JSONObject current = snapshot();
-        JSONArray alarms = current.optJSONArray("alarms");
-        if (alarms == null) return;
-        java.util.Iterator<Map.Entry<Long, PhoneConfirmation>> it = phoneConfirmations.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<Long, PhoneConfirmation> entry = it.next();
-            PhoneConfirmation confirmation = entry.getValue();
-            if (!confirmation.epoch.equals(current.optString("epoch", ""))
-                    || current.optLong("revision", -1) < confirmation.revision) continue;
-            JSONObject match = null;
-            for (int i = 0; i < alarms.length(); i++) {
-                JSONObject alarm = alarms.optJSONObject(i);
-                if (alarm != null && alarm.optLong("id", -1) == entry.getKey()) { match = alarm; break; }
-            }
-            it.remove();
-            if (match != null && match.optBoolean("enabled")) showAlarmConfirmation(match, true);
-        }
     }
     private void showAlarmConfirmation(JSONObject alarm, boolean phone) {
         String message = null;
         try {
             long now = System.currentTimeMillis();
-            if ((phone || AlarmStore.accessProblem(this) == null) && alarm != null
+            if ((phone || (data.available && data.accessProblem == null)) && alarm != null
                     && alarm.optBoolean("enabled") && alarm.isNull("schedulingError"))
                 message = AlarmConfirmation.message(alarm.optLong("nextTriggerAt", 0), now,
                         ZoneId.systemDefault(), Locale.getDefault());

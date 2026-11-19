@@ -35,7 +35,7 @@ final class WatchSchedule {
                     // Phone editing controls retain authoritative enabled state;
                     // the separate retained candidate represents only watch delivery.
                     view.retained.put(new JSONObject(match.toString()).put("uncertain",true));
-                } else row.put("fallbackNotice","Watch fallback: "+(match.optBoolean("ringing")?"ringing":match.optBoolean("uncertain")?"uncertain":"committed"));
+                } else if (match.optBoolean("uncertain")) row.put("fallbackNotice","Watch fallback: uncertain");
             } else {
                 row.put("nextTriggerAt",0).put("snoozedUntil",0);
                 if(row.optBoolean("enabled")) row.put("schedulingError","Watch fallback not committed; phone state is advisory");
