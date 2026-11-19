@@ -28,7 +28,11 @@ import org.json.JSONObject;
 /** Phone snapshot and commands. The watch also schedules independent fallback alarms. */
 public final class PhoneSync {
     public static final String ACTION_CHANGED="com.openclock.PHONE_SYNC_CHANGED";
-    public interface Callback { void onResult(boolean ok,String safeMessage); }
+    public interface Callback {
+        void onResult(boolean ok,String safeMessage);
+        default void onResult(boolean ok,String safeMessage,long revision) { onResult(ok,safeMessage); }
+    }
+    public interface RevisionCallback { void onResult(boolean ok,String safeMessage,long revision); }
     /** status: created, unknown, or not_sent. A created result has positive alarmId and revision. */
     public interface CreateCallback { void onResult(String status,String requestId,long alarmId,long revision); }
     private static final String PREFIX="/openclock/v1/", META=PREFIX+"snapshot", CHUNK=PREFIX+"chunk/",
@@ -46,14 +50,15 @@ public final class PhoneSync {
     private static volatile boolean lastReadComplete;
     private static JSONObject snapshot;
     private static String owner="", reachable="";
+    private static long identityGeneration;
     private static long connectedUntil, complicationConfirmedUntil, lastDiscovery;
     // Failure to record advisory complication state must never block alarm controls.
     private static boolean complicationBarrierFailed;
     private static Pending pending;
     private static final class Pending {
-        final String id,node,epoch,token; final long alarm; final boolean dismiss; final Callback callback;
-        Pending(String id,String node,String epoch,long alarm,String token,boolean dismiss,Callback callback) {
-            this.id=id; this.node=node; this.epoch=epoch; this.alarm=alarm; this.token=token; this.dismiss=dismiss; this.callback=callback;
+        final String id,node,epoch,token; final long alarm,baseRevision; final boolean dismiss; final Callback callback;
+        Pending(String id,String node,String epoch,long alarm,String token,boolean dismiss,long baseRevision,Callback callback) {
+            this.id=id; this.node=node; this.epoch=epoch; this.alarm=alarm; this.token=token; this.dismiss=dismiss; this.baseRevision=baseRevision; this.callback=callback;
         }
     }
     private static SharedPreferences prefs(Context c) { return c.getApplicationContext().getSharedPreferences("phone-snapshot-v1",Context.MODE_PRIVATE); }
@@ -126,6 +131,68 @@ public final class PhoneSync {
         } catch(Exception ignored) { }
     }
     public static void requestSnapshot(Context context) { startFetch(context.getApplicationContext(),true); }
+    // A user refresh has its own queued pass, rather than borrowing a result
+    // from a coalesced discovery that may have started before the request.
+    // This is read-only presentation state, not a mutation receipt.
+    static final class RefreshAttempt {
+        final String owner, epoch, baseline;
+        final long identityGeneration;
+        volatile RefreshRead result;
+        volatile boolean sendFailed;
+        // Written only by the FETCH worker before publishing result.
+        String readNode="", readEpoch="", readJson="";
+        boolean localComplete;
+        RefreshAttempt(String owner,String epoch,String baseline,long identityGeneration) {
+            this.owner=owner; this.epoch=epoch; this.baseline=baseline; this.identityGeneration=identityGeneration;
+        }
+    }
+    static final class RefreshRead {
+        final String node, epoch, json;
+        final boolean localComplete;
+        RefreshRead(String node,String epoch,String json,boolean localComplete) {
+            this.node=node; this.epoch=epoch; this.json=json; this.localComplete=localComplete;
+        }
+    }
+    private static String snapshotContent(JSONObject value) throws Exception {
+        JSONObject copy=new JSONObject(value.toString()); copy.remove("connected"); return copy.toString();
+    }
+    static RefreshAttempt requestExplicitRefresh(Context context) throws Exception {
+        Context c=context.getApplicationContext(); RefreshAttempt attempt;
+        synchronized(PhoneSync.class) {
+            load(c);
+            attempt=new RefreshAttempt(owner,snapshot.optString("epoch"),snapshotContent(snapshot),identityGeneration);
+        }
+        FETCH.execute(()->{
+            try { discoverAndRead(c,true,attempt); }
+            finally {
+                attempt.result=new RefreshRead(attempt.readNode,attempt.readEpoch,attempt.readJson,attempt.localComplete);
+            }
+        });
+        return attempt;
+    }
+    // Must run off MAIN. A result from a different owner/epoch is never this
+    // refresh's successful read, even if a background pass accepted it.
+    static synchronized String explicitRefreshStatus(RefreshAttempt attempt) {
+        if(attempt.sendFailed) return "send_failed";
+        RefreshRead read=attempt.result;
+        if(read==null) return "pending";
+        if(read.json.isEmpty()) return "read_failed";
+        if(attempt.owner.isEmpty()) {
+            // First successful discovery may legitimately establish an owner.
+            if(identityGeneration!=attempt.identityGeneration+1 || !read.node.equals(owner)
+                    || !read.epoch.equals(snapshot.optString("epoch"))) return "owner_changed";
+        } else if(attempt.identityGeneration!=identityGeneration || !attempt.owner.equals(owner)
+                || !attempt.epoch.equals(snapshot.optString("epoch")) || !attempt.owner.equals(read.node)
+                || !attempt.epoch.equals(read.epoch)) return "owner_changed";
+        if(!read.localComplete) return "local_incomplete";
+        try {
+            JSONObject baseline = new JSONObject(attempt.baseline);
+            // A newer accepted publication is useful even though it is not an
+            // acknowledgement of this particular refresh request.
+            if(snapshot.optLong("updatedAt",0)>baseline.optLong("updatedAt",0)) return "newer";
+            return attempt.baseline.equals(snapshotContent(new JSONObject(read.json))) ? "unchanged" : "read";
+        } catch(Exception invalid) { return "read_failed"; }
+    }
     static void changed(Context c) { startFetch(c.getApplicationContext(),false); }
     static void capabilityChanged(Context c) {
         synchronized (PhoneSync.class) { complicationConfirmedUntil=0; }
@@ -170,9 +237,10 @@ public final class PhoneSync {
         if(info.getNodes().size()!=1) return "";
         Node node=info.getNodes().iterator().next(); return node.getId();
     }
-    private static void discoverAndRead(Context c,boolean request) {
+    private static void discoverAndRead(Context c,boolean request) { discoverAndRead(c,request,null); }
+    private static void discoverAndRead(Context c,boolean request,RefreshAttempt attempt) {
         String node="";
-        lastReadComplete=false;
+        if(attempt==null) lastReadComplete=false;
         boolean discoverySucceeded=false;
         try { node=onePhone(c); discoverySucceeded=true; } catch(Exception ignored) { }
         synchronized(PhoneSync.class) {
@@ -181,8 +249,14 @@ public final class PhoneSync {
             // Discovery is not authority to delete the last accepted snapshot.
         }
         broadcast(c);
-        if(node.isEmpty()) { lastReadComplete=discoverySucceeded; return; }
-        if(request) Wearable.getMessageClient(c).sendMessage(node,REQUEST,new byte[0]);
+        if(node.isEmpty()) { if(attempt==null) lastReadComplete=discoverySucceeded; return; }
+        if(request) {
+            if(attempt==null) Wearable.getMessageClient(c).sendMessage(node,REQUEST,new byte[0]);
+            else try {
+                Wearable.getMessageClient(c).sendMessage(node,REQUEST,new byte[0])
+                        .addOnFailureListener(EVENTS,e->attempt.sendFailed=true);
+            } catch(Exception failure) { attempt.sendFailed=true; }
+        }
         try {
             byte[] metaBytes=get(c,node,META); if(metaBytes==null||metaBytes.length>2048) return;
             JSONObject meta=new JSONObject(new String(metaBytes,StandardCharsets.UTF_8));
@@ -226,7 +300,9 @@ public final class PhoneSync {
                 PhoneFallback.reconcile(c,node,next);
                 if(!AlarmStore.phoneSnapshotAccepted(c,node,next)) return;
                 if(!prefs(c).edit().putString("owner",node).putString("snapshot",json).commit()) return;
+                if(!node.equals(owner)||!epoch.equals(snapshot.optString("epoch"))) identityGeneration++;
                 owner=node; snapshot=next; next.put("connected",true);
+                if(attempt!=null) { attempt.readNode=node; attempt.readEpoch=epoch; attempt.readJson=json; }
             }
             boolean fallbackOk=AlarmStore.phoneFallbackProblem(c)==null;
             synchronized(PhoneSync.class) {
@@ -234,10 +310,11 @@ public final class PhoneSync {
             }
             // Finish mirror persistence and notification admission while the listener
             // or repair job still owns its background execution lifetime.
-            lastReadComplete=PhoneMirror.onSnapshot(c,next) && fallbackOk;
+            boolean readComplete=PhoneMirror.onSnapshot(c,next) && fallbackOk;
+            if(attempt==null) lastReadComplete=readComplete; else attempt.localComplete=readComplete;
             PhoneDismissalJob.schedule(c);
             synchronized(PhoneSync.class) {
-                if (lastReadComplete && snapshot == next && node.equals(reachable) && node.equals(owner)) {
+                if (readComplete && snapshot == next && node.equals(reachable) && node.equals(owner)) {
                     complicationConfirmedUntil = SystemClock.elapsedRealtime() + ComplicationPolicy.FRESH_MS;
                     coverCommand(c,next);
                 }
@@ -253,6 +330,14 @@ public final class PhoneSync {
     private static String hex(byte[] bytes) {
         StringBuilder s=new StringBuilder(bytes.length*2);
         for(byte b:bytes) s.append(String.format(java.util.Locale.ROOT,"%02x",b&255)); return s.toString();
+    }
+    /** Like command, but supplies the validated acknowledged revision, or -1 if unavailable. */
+    public static void commandWithRevision(Context context,JSONObject input,RevisionCallback callback) {
+        if(callback==null) return;
+        command(context,input,new Callback() {
+            @Override public void onResult(boolean ok,String message) { callback.onResult(ok,message,-1); }
+            @Override public void onResult(boolean ok,String message,long revision) { callback.onResult(ok,message,revision); }
+        });
     }
     public static void command(Context context,JSONObject input,Callback callback) {
         final Context c=context.getApplicationContext();
@@ -287,7 +372,7 @@ public final class PhoneSync {
                     }
                     if(!cp.edit().putString("barrier",barrier.toString()).commit()) complicationBarrierFailed=true;
                 } catch(Exception failure) { complicationBarrierFailed=true; }
-                pending=new Pending(id,node,epoch,alarm,token,"finish".equals(op)&&!value,callback);
+                pending=new Pending(id,node,epoch,alarm,token,"finish".equals(op)&&!value,rev,callback);
             }
         } catch(Exception e) { MAIN.post(()->callback.onResult(false,"Phone unavailable or snapshot not ready; refresh")); return; }
         broadcast(c);
@@ -815,10 +900,18 @@ public final class PhoneSync {
                         SystemClock.elapsedRealtime()>=connectedUntil||
                         (pending.dismiss&&!noNewerSession(snapshot,pending.alarm,pending.token))) ok=false;
                 if(!ok&&pending.dismiss) { startFetch(context.getApplicationContext(),true); return; }
-                long committedRevision = result.opt("revision") instanceof Number ? result.optLong("revision",-1) : -1;
+                long committedRevision = ok ? commandRevision(result,pending.baseRevision) : -1;
                 finish(context.getApplicationContext(),id,ok,ok?"Phone alarm updated":"Phone change not confirmed; refresh on watch",committedRevision);
             }
         } catch(Exception ignored) { }
+    }
+    static long commandRevision(JSONObject result,long baseRevision) {
+        try {
+            Object value=result.opt("revision");
+            if(!(value instanceof Number) || baseRevision<0) return -1;
+            long revision=new java.math.BigDecimal(value.toString()).longValueExact();
+            return revision>=baseRevision ? revision : -1;
+        } catch(Exception invalid) { return -1; }
     }
     private static void finish(Context c,String id,boolean ok,String message) {
         finish(c,id,ok,message,-1);
@@ -836,7 +929,7 @@ public final class PhoneSync {
                 }
             } catch(Exception ignored) { }
         }
-        MAIN.post(()->callback.onResult(ok,message));
+        MAIN.post(()->callback.onResult(ok,message,committedRevision));
         broadcast(c);
         startFetch(c,true);
     }

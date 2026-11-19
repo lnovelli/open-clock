@@ -44,10 +44,8 @@ import androidx.wear.widget.SwipeDismissFrameLayout;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.Calendar;
 import java.util.Locale;
 
@@ -61,7 +59,7 @@ public class MainActivity extends Activity {
     private WatchUiWork work;
     private android.widget.FrameLayout windowRoot;
     private View progress;
-    private boolean loading, reloadAgain;
+    private boolean loading, reloadAgain, refreshAfterWork;
     private long dataGeneration;
     private int savedListScroll;
     private boolean renderedListAvailable, restoringListScroll;
@@ -76,12 +74,12 @@ public class MainActivity extends Activity {
     private long editingId = -1;
     private String editingOriginal = "";
     private String editingTarget = "";
-    private boolean dateChanged;
+    private boolean dateChanged, dateChosen;
     private String chosenDate = "";
     private String draftCreateId = "", renderedCreateStatus = "";
     private String label = "";
     private String phoneNotice = "";
-    private boolean registered;
+    private boolean registered, resumed;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private boolean complicationScrollPending;
     private String complicationScrollKey;
@@ -124,6 +122,7 @@ public class MainActivity extends Activity {
             draftCreateId = state.getString("draftCreateId", "");
             editingId = state.getLong("editingId", -1); editingOriginal = state.getString("editingOriginal", "");
             editingTarget = state.getString("editingTarget", ""); dateChanged = state.getBoolean("dateChanged", false);
+            dateChosen = state.getBoolean("dateChosen", false);
             chosenDate = state.getString("chosenDate", "");
         }
         if (state == null && ACTION_OPEN_COMPLICATION.equals(getIntent().getAction())) beginComplicationScroll();
@@ -184,8 +183,11 @@ public class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        resumed = true;
         if (page == 0) renderListIfChanged();
     }
+
+    @Override protected void onPause() { resumed = false; super.onPause(); }
 
     @Override protected void onStop() {
         work.detach(this);
@@ -205,6 +207,7 @@ public class MainActivity extends Activity {
         out.putString("draftCreateId", work.draftRequestId.isEmpty() ? draftCreateId : work.draftRequestId);
         out.putLong("editingId", editingId); out.putString("editingOriginal", editingOriginal);
         out.putString("editingTarget", editingTarget); out.putBoolean("dateChanged", dateChanged);
+        out.putBoolean("dateChosen", dateChosen);
         out.putString("chosenDate", chosenDate);
         out.putBoolean("operationActive", work.phase != null || interruptedOperation);
         out.putInt("listScroll", scroll != null && renderedListAvailable && !restoringListScroll && scroll.isLaidOut()
@@ -313,7 +316,16 @@ public class MainActivity extends Activity {
             });
         }
     }
-    void workChanged() { showWork(); if (!work.busy()) reloadData(); }
+    void workChanged(boolean refresh) {
+        showWork();
+        if (work.busy()) {
+            if (loading) refreshAfterWork = true;
+            return;
+        }
+        if (refresh || refreshAfterWork) { refreshAfterWork = false; reloadData(); }
+        else if (registered && page == 0 && (renderedPage != 0 || !listStateKey().equals(renderedListState))) render();
+        else if (registered && page == 2 && createOnPhone && !draftCreateStatus().equals(renderedCreateStatus)) render();
+    }
     void showWork() {
         if (windowRoot == null) return;
         if (progress != null) { windowRoot.removeView(progress); progress = null; }
@@ -327,6 +339,8 @@ public class MainActivity extends Activity {
         LinearLayout shield = column(); shield.setGravity(Gravity.CENTER);
         shield.setPadding(dp(36), dp(28), dp(36), dp(28));
         shield.setBackgroundColor(0xbb000000); shield.setClickable(true); shield.setFocusable(true);
+        // Keep the visible watch awake only while this progress view is attached.
+        shield.setKeepScreenOn(true);
         shield.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
         shield.addView(new android.widget.ProgressBar(this), new LinearLayout.LayoutParams(dp(40), dp(40)));
         TextView message = text(phase, 15, WHITE, true); message.setGravity(Gravity.CENTER);
@@ -338,6 +352,9 @@ public class MainActivity extends Activity {
     }
     void acceptWorkData(WatchUiData fresh) { dataGeneration++; data = fresh; }
     private void reloadData() {
+        // A read started under the admission fence may skip committed-receipt cleanup.
+        // Ensure one post-work refresh, but a normal later reload already satisfies it.
+        refreshAfterWork = work.busy();
         if (loading) { reloadAgain = true; return; }
         loading = true;
         final long generation = dataGeneration;
@@ -415,12 +432,34 @@ public class MainActivity extends Activity {
         });
     }
     private void refreshPhone() {
-        long previous = snapshot().optLong("updatedAt", 0);
         startPhoneOperation("Synchronizing with phone…", (app, op) -> {
-            PhoneSync.requestSnapshot(app);
-            awaitPhone(op, app, "", -1, 0, null, false, false, previous,
-                android.os.SystemClock.elapsedRealtime() + 25_000L);
+            long deadline = android.os.SystemClock.elapsedRealtime() + 25_000L;
+            try { awaitExplicitRefresh(op, PhoneSync.requestExplicitRefresh(app), deadline); }
+            catch (Exception unavailable) {
+                op.finish(a -> { a.phoneNotice = "Phone refresh unavailable; cached state may be stale."; a.render(); a.toast(a.phoneNotice); });
+            }
         });
+    }
+    private static void awaitExplicitRefresh(WatchUiWork operation, PhoneSync.RefreshAttempt attempt, long deadline) {
+        // A successful DataItem read can precede the phone's asynchronous publication,
+        // even when the data differs from our baseline. It is not a request receipt.
+        String status = PhoneSync.explicitRefreshStatus(attempt);
+        boolean failed = "send_failed".equals(status) || "read_failed".equals(status)
+                || "local_incomplete".equals(status) || "owner_changed".equals(status);
+        if (failed || "newer".equals(status) || android.os.SystemClock.elapsedRealtime() >= deadline) {
+            String notice = "newer".equals(status) ? "Newer phone snapshot received."
+                : "send_failed".equals(status) ? "Phone refresh request failed; cached state may be stale."
+                : "read_failed".equals(status) ? "Phone snapshot could not be read or accepted; cached state may be stale."
+                : "local_incomplete".equals(status) ? "Phone snapshot read; local sync incomplete. Check cached state."
+                : "owner_changed".equals(status) ? "Phone identity changed during refresh; check the phone list."
+                : "unchanged".equals(status) ? "Same phone snapshot read; refresh not confirmed. Cached state may be stale."
+                : "read".equals(status) ? "Phone snapshot read; refresh not confirmed. Cached state may be stale."
+                : "Phone refresh not confirmed; cached state may be stale.";
+            operation.finish(a -> { a.phoneNotice = notice; a.render(); a.toast(notice); });
+        } else {
+            new Handler(Looper.getMainLooper()).postDelayed(() -> WatchUiWork.IO.execute(() ->
+                awaitExplicitRefresh(operation, attempt, deadline)), 400L);
+        }
     }
     private void phoneResult(WatchUiWork operation, String status, long id, long revision, String epoch, boolean closeEditor) {
         Context app = getApplicationContext();
@@ -454,14 +493,7 @@ public class MainActivity extends Activity {
         JSONObject snapshot;
         try { synchronized (PhoneSync.class) { snapshot = new JSONObject(PhoneSync.cached(app).toString()); } }
         catch (Exception unavailable) { snapshot = new JSONObject(); }
-        boolean matched = updatedAfter >= 0 ? snapshot.optLong("updatedAt") > updatedAfter
-            : !epoch.isEmpty() && epoch.equals(snapshot.optString("epoch")) && snapshot.optLong("revision", -1) >= revision;
-        JSONObject row = null; JSONArray rows = snapshot.optJSONArray("alarms");
-        if (rows != null) for (int i = 0; i < rows.length(); i++) {
-            JSONObject candidate = rows.optJSONObject(i);
-            if (candidate != null && candidate.optLong("id") == id) { row = candidate; break; }
-        }
-        if (expected != null) matched &= row != null && row.optBoolean("enabled") == expected;
+        boolean matched = phoneSnapshotMatched(snapshot, epoch, revision, id, expected, updatedAfter);
         if (matched || android.os.SystemClock.elapsedRealtime() >= deadline) {
             final boolean observed = matched;
             operation.finish(a -> {
@@ -482,6 +514,19 @@ public class MainActivity extends Activity {
             new Handler(Looper.getMainLooper()).postDelayed(() -> WatchUiWork.IO.execute(() ->
                 awaitPhone(operation, app, epoch, revision, id, expected, confirm, closeEditor, updatedAfter, deadline)), 400L);
         }
+    }
+    static boolean phoneSnapshotMatched(JSONObject snapshot, String epoch, long revision,
+            long id, Boolean expected, long updatedAfter) {
+        boolean matched = updatedAfter >= 0 ? snapshot.optLong("updatedAt") > updatedAfter
+            : revision >= 0 && !epoch.isEmpty() && epoch.equals(snapshot.optString("epoch")) && snapshot.optLong("revision", -1) >= revision;
+        if (!matched || expected == null) return matched;
+        JSONArray rows = snapshot.optJSONArray("alarms");
+        if (rows != null) for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i);
+            if (row != null && row.optLong("id") == id)
+                return row.opt("enabled") instanceof Boolean && row.optBoolean("enabled") == expected;
+        }
+        return false;
     }
     private void title(String s) { TextView t = text(s, 24, WHITE, true); t.setGravity(Gravity.CENTER); add(t, 0); }
     private void section(String s) { TextView t = text(s, 16, WHITE, true); add(t, 20); }
@@ -512,7 +557,6 @@ public class MainActivity extends Activity {
         phoneList();
         syncStatus();
         if (connected(snapshot())) add(button("Refresh phone", CARD, this::refreshPhone), 10);
-        add(button("Do Not Disturb", CARD, this::dndHelp), 20);
         add(button("Test double shake", CARD, () -> startActivity(new Intent(this, ShakeTestActivity.class))), 20);
         add(button("Check for updates", CARD, () -> UpdateChecker.show(this, "watch")), 20);
     }
@@ -550,39 +594,11 @@ public class MainActivity extends Activity {
         WatchUiWork.IO.execute(() -> {
             try {
                 JSONObject current = mirror ? PhoneMirror.current(app, id, token) : AlarmStore.active(app, id, token);
-                operation.finish(a -> { if (current != null) a.startActivity(mirror ? PhoneMirror.openIntent(a, current) : AlarmNotifications.alertIntent(a, current)); });
+                if (current == null) operation.finish(a -> { });
+                else operation.finishReadOnly(a -> a.startActivity(mirror ? PhoneMirror.openIntent(a, current) : AlarmNotifications.alertIntent(a, current)));
             } catch (Exception unavailable) { operation.finish(a -> a.toast("Ringing state unavailable; reopen controls")); }
         });
     }
-    private void dndHelp() {
-        NotificationManager nm = getSystemService(NotificationManager.class);
-        boolean granted = nm != null && nm.isNotificationPolicyAccessGranted();
-        new AlertDialog.Builder(this).setTitle("Alarms and Do Not Disturb")
-            .setMessage("Allow alarms in the watch's Do Not Disturb settings. Sound and vibration follow each alarm's settings. "
-                + "DND access is optional and lets alarm notifications request priority-mode bypass; "
-                + "it does not bypass DND for continuous sound or vibration. "
-                + "Wear OS may block opening the alarm screen from the background; tap the notification for controls. "
-                + "Total silence, volume, notification settings and watch restrictions can still prevent alerts.\n\nDND access: "
-                + (granted ? "allowed" : "not allowed"))
-            .setPositiveButton("DND settings", (d, w) -> openDndSettings())
-            .setNeutralButton("DND access", (d, w) -> openDndAccess())
-            .setNegativeButton("Close", null).show();
-    }
-    private void openDndSettings() {
-        try { startActivity(new Intent(Settings.ACTION_ZEN_MODE_PRIORITY_SETTINGS)); }
-        catch (Exception unavailable) {
-            try { startActivity(new Intent(Settings.ACTION_SETTINGS)); }
-            catch (Exception e) { toast("DND settings unavailable on this watch"); }
-        }
-    }
-    private void openDndAccess() {
-        try { startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)); }
-        catch (Exception unavailable) {
-            try { startActivity(new Intent(Settings.ACTION_SETTINGS)); }
-            catch (Exception e) { toast("DND access settings unavailable on this watch"); }
-        }
-    }
-
     private boolean createBlocked() {
         try {
             JSONObject pendingCreate = data.creation;
@@ -692,7 +708,7 @@ public class MainActivity extends Activity {
         hour = c.get(Calendar.HOUR_OF_DAY); minute = c.get(Calendar.MINUTE);
         month = c.get(Calendar.MONTH) + 1; day = c.get(Calendar.DAY_OF_MONTH);
         hasDate = false; sound = false; vibrate = true; label = "";
-        editingId = -1; editingOriginal = ""; editingTarget = ""; dateChanged = false; chosenDate = "";
+        editingId = -1; editingOriginal = ""; editingTarget = ""; dateChanged = false; dateChosen = false; chosenDate = "";
         draftCreateId = ""; work.draftRequestId = ""; interruptedOperation = false;
         createOnPhone = phone; page = 1; render();
     }
@@ -705,7 +721,7 @@ public class MainActivity extends Activity {
             editingTarget = phone ? target.toString() : "";
             hour = alarm.getInt("hour"); minute = alarm.getInt("minute");
             label = alarm.optString("label", ""); sound = alarm.optBoolean("sound", true);
-            vibrate = alarm.optBoolean("vibrate", true); dateChanged = false;
+            vibrate = alarm.optBoolean("vibrate", true); dateChanged = false; dateChosen = false;
             String savedDate = alarm.isNull("date") ? "" : alarm.optString("date", "");
             chosenDate = savedDate;
             hasDate = !savedDate.isEmpty();
@@ -939,8 +955,11 @@ public class MainActivity extends Activity {
         WatchUiWork.IO.execute(() -> {
             JSONObject target = PhoneSync.captureMutationTarget(app, displayed.optLong("id", -1));
             JSONObject current = target == null ? null : target.optJSONObject("alarm");
-            operation.finish(a -> {
-                if (current == null || !sameEditableAlarm(displayed, current)) { a.toast("Phone changed or disconnected; refresh the list"); return; }
+            if (current == null || !sameEditableAlarm(displayed, current)) {
+                operation.finish(a -> a.toast("Phone changed or disconnected; refresh the list"));
+                return;
+            }
+            operation.finishReadOnly(a -> {
                 if (directDelete) a.confirmDelete(current, true, target);
                 else if (actions) a.alarmActions(current, true, target);
                 else a.beginEdit(current, true, target);
@@ -1047,11 +1066,31 @@ public class MainActivity extends Activity {
         startPhoneOperation((app, op) -> {
             synchronized (PhoneSync.class) {
                 JSONObject base = PhoneSync.cached(app);
-                long revision = base.optLong("revision", -1); String epoch = base.optString("epoch");
-                PhoneSync.command(app, new JSONObject().put("op", "setEnabled").put("id", id).put("enabled", enabled),
-                    (ok, safeMessage) -> {
-                        if (!ok) phoneResult(op, "unknown", id, revision + 1, epoch, false);
-                        else WatchUiWork.IO.execute(() -> awaitPhone(op, app, epoch, revision + 1, id, enabled,
+                String epoch = base.optString("epoch");
+                JSONArray rows = base.optJSONArray("alarms"); JSONObject row = null;
+                if (rows != null) for (int i = 0; i < rows.length(); i++) {
+                    JSONObject candidate = rows.optJSONObject(i);
+                    if (candidate != null && candidate.optLong("id", -1) == id) { row = candidate; break; }
+                }
+                // Capture only the row paired with the command's cached revision.
+                final String cachedDate = row != null && row.opt("date") instanceof String ? row.optString("date") : "";
+                final int cachedHour = row == null ? -1 : row.optInt("hour", -1);
+                final int cachedMinute = row == null ? -1 : row.optInt("minute", -1);
+                PhoneSync.commandWithRevision(app, new JSONObject().put("op", "setEnabled").put("id", id).put("enabled", enabled),
+                    (ok, safeMessage, revision) -> {
+                        if (!ok && enabled && WatchDateChoice.appearsPast(cachedDate, cachedHour, cachedMinute,
+                                System.currentTimeMillis(), ZoneId.systemDefault())) op.finish(a -> {
+                            a.phoneNotice = "Cached phone date " + cachedDate + " and time appear past on this watch. "
+                                + "The cache or phone clock/zone may differ; edit the date on the phone if needed. "
+                                + "Phone result unconfirmed; check the phone before retrying. It may already have changed.";
+                            a.render(); a.toast(a.phoneNotice);
+                        });
+                        else if (!ok) phoneResult(op, "unknown", id, -1, epoch, false);
+                        else if (revision < 0) op.finish(a -> {
+                            a.phoneNotice = "Phone acknowledged the change; updated list not confirmed. Check the phone before retrying.";
+                            a.render(); a.toast(a.phoneNotice);
+                        });
+                        else WatchUiWork.IO.execute(() -> awaitPhone(op, app, epoch, revision, id, enabled,
                             enabled, false, -1, android.os.SystemClock.elapsedRealtime() + 15_000L));
                     });
             }
@@ -1128,22 +1167,28 @@ public class MainActivity extends Activity {
         dialog.setOnCancelListener(d -> { label = before; }); dialog.show();
     }
     private void dateDialog() {
-        final int previousMonth = month, previousDay = day;
+        final int[] selection = {month, day};
+        final String draft = saveDraftKey();
         LinearLayout row = new LinearLayout(this); row.setGravity(Gravity.CENTER);
-        NumberPicker m = picker(1, 12, month, (p, old, val) -> month = val);
-        NumberPicker d = picker(1, 31, day, (p, old, val) -> day = val);
+        NumberPicker m = picker(1, 12, month, (p, old, val) -> selection[0] = val);
+        NumberPicker d = picker(1, 31, day, (p, old, val) -> selection[1] = val);
         m.setDescendantFocusability(NumberPicker.FOCUS_BLOCK_DESCENDANTS); d.setDescendantFocusability(NumberPicker.FOCUS_BLOCK_DESCENDANTS);
         m.setContentDescription("Month"); d.setContentDescription("Day of month");
         row.addView(m, new LinearLayout.LayoutParams(0, dp(125), 1)); row.addView(text("/", 22, WHITE, true));
         row.addView(d, new LinearLayout.LayoutParams(0, dp(125), 1));
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Month / day").setView(row)
-            .setNegativeButton("Cancel", (x, y) -> { month = previousMonth; day = previousDay; if (page == 2) render(); })
-            .setNeutralButton(hasDate ? "Clear" : null, (x, y) -> { hasDate = false; chosenDate = ""; dateChanged = originalDateChanged(null); if (page == 2) render(); })
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton(hasDate ? "Clear" : null, (x, y) -> {
+                if (!editorReady() || !draft.equals(saveDraftKey())) return;
+                hasDate = false; chosenDate = ""; dateChosen = false; dateChanged = originalDateChanged(null); render();
+            })
             .setPositiveButton("Use date", null).create();
-        dialog.setOnCancelListener(x -> { month = previousMonth; day = previousDay; if (page == 2) render(); });
         dialog.setOnShowListener(x -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
-                LocalDate chosen = resolveDate(); dialog.dismiss();
+                if (!editorReady() || !draft.equals(saveDraftKey())) { dialog.dismiss(); return; }
+                LocalDate chosen = WatchDateChoice.resolve(selection[0], selection[1], hour, minute,
+                        System.currentTimeMillis(), ZoneId.systemDefault());
+                dialog.dismiss();
                 boolean repeats = false;
                 if (editingId > 0) {
                     JSONArray days = new JSONObject(editingOriginal).optJSONArray("days"); repeats = days != null && days.length() > 0;
@@ -1151,10 +1196,12 @@ public class MainActivity extends Activity {
                 String warning = repeats ? " This replaces the repeating schedule." : "";
                 new AlertDialog.Builder(this).setTitle("One-time date")
                     .setMessage("Alarm for " + chosen + "." + warning)
-                    .setNegativeButton("Cancel", (d1, w) -> { month = previousMonth; day = previousDay; })
+                    .setNegativeButton("Cancel", null)
                     .setPositiveButton("Use date", (d1, w) -> {
-                        hasDate = true; chosenDate = chosen.toString(); dateChanged = originalDateChanged(chosenDate); if (page == 2) render();
-                    }).setOnCancelListener(d1 -> { month = previousMonth; day = previousDay; }).show();
+                        if (!editorReady() || !draft.equals(saveDraftKey())) return;
+                        month = selection[0]; day = selection[1]; hasDate = true; chosenDate = chosen.toString();
+                        dateChosen = true; dateChanged = originalDateChanged(chosenDate); render();
+                    }).show();
             }
             catch (Exception e) { toast(AlarmStore.message(e)); }
         }));
@@ -1168,40 +1215,60 @@ public class MainActivity extends Activity {
             return !java.util.Objects.equals(previous, date);
         } catch (Exception e) { return true; }
     }
-    /** Resolve at save time so a draft crossing midnight does not silently schedule in the past. */
-    private LocalDate resolveDate() {
-        ZoneId zone = ZoneId.systemDefault(); long now = System.currentTimeMillis();
-        int year = Instant.ofEpochMilli(now).atZone(zone).getYear();
-        LocalDate today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate();
-        for (int y = year; y <= year + 8 && y <= 9999; y++) {
-            LocalDate date;
-            try {
-                date = LocalDate.of(y, month, day);
-            } catch (java.time.DateTimeException invalidDate) { continue; }
-            if (date.isBefore(today)) continue;
-            if (zone.getRules().getValidOffsets(date.atTime(hour, minute)).isEmpty())
-                throw new IllegalArgumentException("That time doesn't exist on this date due to daylight saving time");
-            try {
-                AlarmTimes.next(hour, minute, date.toString(), java.util.Collections.emptySet(), now, zone);
-                return date;
-            } catch (IllegalArgumentException alreadyPassed) { /* Today's time has passed. */ }
-        }
-        throw new IllegalArgumentException("No future valid date");
-    }
     private void save() {
+        saveChecked(null, null, null, false);
+    }
+    private boolean editorReady() {
+        return registered && resumed && !isFinishing() && !isDestroyed() && page == 2 && !work.busy();
+    }
+    private String saveDraftKey() {
+        return new JSONArray().put(page).put(hour).put(minute).put(month).put(day).put(hasDate)
+            .put(sound).put(vibrate).put(label).put(createOnPhone).put(editingId)
+            .put(editingOriginal).put(editingTarget).put(dateChanged).put(dateChosen).put(chosenDate)
+            .put(draftCreateId).put(interruptedOperation).toString();
+    }
+    private void saveChecked(String expectedDraft, LocalDate confirmedDate, String expectedZone, boolean scheduleConfirmed) {
+        if (!editorReady()) return;
         if (interruptedOperation) { toast("Previous update may have completed. Return to the list and check before saving again."); return; }
+        if (expectedDraft != null && !expectedDraft.equals(saveDraftKey())) {
+            toast("Alarm changed; review it and save again"); return;
+        }
         try {
-            LocalDate date = hasDate && (editingId <= 0 || dateChanged) ? resolveDate() : null;
-            if (date != null && !date.toString().equals(chosenDate))
-                throw new IllegalArgumentException("Date changed; choose and confirm it again");
-            if (editingId > 0 && scheduleChanged()) {
+            ZoneId zone = ZoneId.systemDefault(); long now = System.currentTimeMillis();
+            if (expectedZone != null && !expectedZone.equals(zone.getId()))
+                throw new IllegalArgumentException("Time zone changed; review the alarm and save again");
+            LocalDate date = hasDate && (editingId <= 0 || dateChanged || dateChosen)
+                ? WatchDateChoice.resolve(month, day, hour, minute, now, zone) : null;
+            if (confirmedDate != null && !confirmedDate.equals(date))
+                throw new IllegalArgumentException("Date changed; review the alarm and save again");
+            // An unchosen existing fixed date stays fixed, even when the time is edited.
+            // Do not pre-judge a phone-owned alarm using the watch's clock or zone.
+            if (!createOnPhone && hasDate && editingId > 0 && date == null) {
+                JSONObject original = new JSONObject(editingOriginal);
+                if (!original.optBoolean("enabled", false) || scheduleChanged())
+                    AlarmTimes.next(hour, minute, chosenDate, java.util.Collections.emptySet(), now, zone);
+            }
+            String draft = saveDraftKey(); String zoneId = zone.getId();
+            if (date != null && confirmedDate == null && WatchDateChoice.needsConfirmation(date, chosenDate, now, zone)) {
+                int year = java.time.Instant.ofEpochMilli(now).atZone(zone).getYear();
+                String notice = date.getYear() == year + 1
+                    ? "This alarm will be set for next year: " + date + ". Save?"
+                    : date.getYear() > year ? "This alarm will be set for a future year: " + date + ". Save?"
+                    : "Save alarm for " + date + "?";
+                new AlertDialog.Builder(this).setTitle("Confirm alarm date")
+                    .setMessage(notice)
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Save", (d, w) -> saveChecked(draft, date, zoneId, false)).show();
+            } else if (editingId > 0 && (scheduleChanged() || (date != null && originalDateChanged(date.toString()))) && !scheduleConfirmed) {
                 new AlertDialog.Builder(this).setTitle("Change schedule?")
                     .setMessage("Changing the schedule can stop an active ring or snooze.")
-                    .setNegativeButton("Cancel", null).setPositiveButton("Save", (d, w) -> {
-                        try { saveEdit(date); } catch (Exception e) { toast(AlarmStore.message(e)); }
-                    }).show();
-            } else if (editingId > 0) saveEdit(date);
-            else if (createOnPhone) saveOnPhone(date); else saveResolved(date);
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Save", (d, w) -> saveChecked(draft, date, zoneId, true)).show();
+            } else {
+                if (date != null) { chosenDate = date.toString(); dateChanged = originalDateChanged(chosenDate); }
+                if (editingId > 0) saveEdit(date);
+                else if (createOnPhone) saveOnPhone(date); else saveResolved(date);
+            }
         } catch (Exception e) { toast(AlarmStore.message(e)); }
     }
     private boolean scheduleChanged() {

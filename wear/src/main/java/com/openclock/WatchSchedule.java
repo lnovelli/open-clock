@@ -13,7 +13,17 @@ final class WatchSchedule {
         boolean uncertain;
     }
     static View read(Context c,JSONObject snapshot) throws Exception {
-        View view=new View(); JSONArray fallback=AlarmStore.phoneFallbackAlarms(c);
+        return join(c,snapshot,AlarmStore.phoneFallbackAlarms(c),null,null,null);
+    }
+    // Owners were checked under the same PhoneSync monitor as the phone and
+    // store reads; never revalidate this detached generation against a newer cache.
+    static View read(Context c,JSONObject snapshot,JSONArray fallback,JSONArray pending,
+                     String problem,Set<JSONObject> owners) throws Exception {
+        return join(c,snapshot,fallback,pending,problem,owners);
+    }
+    private static View join(Context c,JSONObject snapshot,JSONArray fallback,JSONArray pending,
+                             String problem,Set<JSONObject> owners) throws Exception {
+        View view=new View();
         JSONArray source=snapshot==null?null:snapshot.optJSONArray("alarms"); Set<Long> used=new HashSet<>();
         if(source==null) { source=new JSONArray(); view.uncertain=true; }
         for(int i=0;i<source.length();i++) {
@@ -21,7 +31,7 @@ final class WatchSchedule {
             for(int j=0;j<fallback.length();j++) {
                 JSONObject candidate=fallback.getJSONObject(j);
                 if(candidate.optLong("phoneId")==row.optLong("id")&&candidate.optString("phoneEpoch").equals(snapshot.optString("epoch"))
-                    &&PhoneSync.fallbackOwner(c,candidate.optString("phoneNode"),candidate.optString("phoneEpoch"))) {
+                    &&(owners==null?PhoneSync.fallbackOwner(c,candidate.optString("phoneNode"),candidate.optString("phoneEpoch")):owners.contains(candidate))) {
                     if(match!=null) { view.uncertain=true; match=null; break; } match=candidate;
                 }
             }
@@ -45,10 +55,12 @@ final class WatchSchedule {
         }
         for(int i=0;i<fallback.length();i++) {
             JSONObject row=fallback.getJSONObject(i);
-            if(!used.contains(row.getLong("id"))) { row.put("uncertain",true); view.retained.put(row); view.uncertain=true; }
+            if(!used.contains(row.getLong("id"))) {
+                view.retained.put((owners==null?row:new JSONObject(row.toString())).put("uncertain",true)); view.uncertain=true;
+            }
         }
-        if(AlarmStore.phoneFallbackProblem(c)!=null) view.uncertain=true;
-        JSONArray pending=AlarmStore.watchSnoozeRequests(c);
+        if((owners==null?AlarmStore.phoneFallbackProblem(c):problem)!=null) view.uncertain=true;
+        if(owners==null) pending=AlarmStore.watchSnoozeRequests(c);
         for(int i=0;i<pending.length();i++) {
             JSONObject r=pending.getJSONObject(i);
             if("pending".equals(r.optString("state"))||("branched".equals(r.optString("state"))&&!r.has("receipt"))) view.uncertain=true;

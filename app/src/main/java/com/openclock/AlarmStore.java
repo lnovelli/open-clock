@@ -120,17 +120,19 @@ public final class AlarmStore {
     public static synchronized JSONArray alarms(Context c) {
         try {
             migrateLegacyWatchSnoozes(c);
-            JSONArray source=state(c).getJSONArray("alarms"), result=new JSONArray();
-            String problem=accessProblem(c);
-            for(int i=0;i<source.length();i++) {
-                JSONObject stored=source.getJSONObject(i);
-                if(stored.optBoolean("_phoneFallback")) continue;
-                JSONObject a=publicAlarm(stored);
-                if(a.optBoolean("enabled")&&problem!=null) a.put("schedulingError",problem).put("nextTriggerAt",0);
-                result.put(a);
-            }
-            return result;
+            return publicAlarms(state(c).getJSONArray("alarms"),accessProblem(c));
         } catch(Exception e) { throw new IllegalStateException(e); }
+    }
+    private static JSONArray publicAlarms(JSONArray source,String problem) throws JSONException {
+        JSONArray result=new JSONArray();
+        for(int i=0;i<source.length();i++) {
+            JSONObject stored=source.getJSONObject(i);
+            if(stored.optBoolean("_phoneFallback")) continue;
+            JSONObject a=publicAlarm(stored);
+            if(a.optBoolean("enabled")&&problem!=null) a.put("schedulingError",problem).put("nextTriggerAt",0);
+            result.put(a);
+        }
+        return result;
     }
     public static synchronized JSONArray groups(Context c) {
         try { return new JSONArray(state(c).getJSONArray("groups").toString()); }
@@ -679,19 +681,30 @@ public final class AlarmStore {
     static synchronized String phoneFallbackProblem(Context c) {
         try {
             String access=accessProblem(c); if(access!=null) return access;
-            JSONObject state=state(c); JSONArray rows=state.getJSONArray("alarms");
-            for(int i=0;i<rows.length();i++) { JSONObject a=rows.getJSONObject(i);
-                if(a.optBoolean("_phoneFallback")&&a.has("_error")) return a.optString("_error");
-            }
-            if(state.optJSONArray("_phoneStaged")!=null&&state.getJSONArray("_phoneStaged").length()>0) return "Phone fallback token cleanup pending";
-            return state.has("_phoneDesired")?"Phone fallback changes pending; retry scheduled":null;
+            return phoneFallbackProblem(state(c));
         } catch(Exception e) { return "Phone fallback state unavailable"; }
+    }
+    private static String phoneFallbackProblem(JSONObject state) throws JSONException {
+        JSONArray rows=state.getJSONArray("alarms");
+        for(int i=0;i<rows.length();i++) { JSONObject a=rows.getJSONObject(i);
+            if(a.optBoolean("_phoneFallback")&&a.has("_error")) return a.optString("_error");
+        }
+        if(state.optJSONArray("_phoneStaged")!=null&&state.getJSONArray("_phoneStaged").length()>0) return "Phone fallback token cleanup pending";
+        return state.has("_phoneDesired")?"Phone fallback changes pending; retry scheduled":null;
     }
     // A snapshot and its revision must come from the same synchronized store generation.
     static synchronized JSONObject wearSnapshot(Context c) throws Exception {
         migrateLegacyWatchSnoozes(c);
-        JSONObject s=state(c); JSONArray ringing=new JSONArray(), rows=s.getJSONArray("alarms"), published=alarms(c);
+        JSONObject s=state(c); JSONArray published=alarms(c);
         long now=System.currentTimeMillis();
+        JSONArray ringing=wearRows(c,s.getJSONArray("alarms"),published,now);
+        return new JSONObject().put("snoozeProtocol",2).put("revision",s.optLong("_wearRevision",0))
+            .put("updatedAt",now).put("alarms",published).put("groups",groups(c)).put("active",ringing)
+            .put("phoneFallbacks",phoneFallbackAlarms(c)).put("watchSnoozeRequests",watchSnoozeRequests(c));
+    }
+    // Adds published occurrence/lineage fields and returns public active sessions.
+    private static JSONArray wearRows(Context c,JSONArray rows,JSONArray published,long now) throws Exception {
+        JSONArray ringing=new JSONArray();
         for(int i=0;i<published.length();i++) {
             JSONObject row=published.getJSONObject(i), stored=find(rows,row.getLong("id"));
             String pending=stored.optString("_token","");
@@ -720,9 +733,40 @@ public final class AlarmStore {
                 ringing.put(item);
             }
         }
-        return new JSONObject().put("snoozeProtocol",2).put("revision",s.optLong("_wearRevision",0))
-            .put("updatedAt",now).put("alarms",published).put("groups",groups(c)).put("active",ringing)
-            .put("phoneFallbacks",phoneFallbackAlarms(c)).put("watchSnoozeRequests",watchSnoozeRequests(c));
+        return ringing;
+    }
+    /** One detached watch UI generation. Call while holding AlarmStore.class. */
+    static final class WatchUiSnapshot {
+        JSONArray alarms, active, fallback, snoozes, selectionAlarms, selectionActive;
+        String accessProblem, fallbackProblem, phoneNode, phoneEpoch;
+        long phoneRevision, phonePublished;
+        boolean accepted(JSONObject snapshot) {
+            try {
+                return !phoneNode.isEmpty() && phoneEpoch.equals(snapshot.getString("epoch"))
+                    && phoneRevision==snapshot.getLong("revision") && phonePublished==snapshot.getLong("updatedAt");
+            } catch(Exception e) { return false; }
+        }
+    }
+    static WatchUiSnapshot watchUiSnapshot(Context c) throws Exception {
+        if(!Thread.holdsLock(AlarmStore.class)) throw new IllegalStateException("AlarmStore lock required");
+        JSONObject s=migrateLegacyWatchSnoozes(c);
+        JSONArray rows=s.getJSONArray("alarms");
+        // wearSnapshot also requires groups to be readable even though selection does not use them.
+        s.getJSONArray("groups");
+        WatchUiSnapshot out=new WatchUiSnapshot();
+        out.phoneNode=s.optString("_phoneNode"); out.phoneEpoch=s.optString("_phoneEpoch");
+        out.phoneRevision=s.optLong("_phoneRevision",-1); out.phonePublished=s.optLong("_phonePublished",0);
+        out.accessProblem=accessProblem(c);
+        out.alarms=publicAlarms(rows,out.accessProblem);
+        long now=System.currentTimeMillis();
+        out.active=activeRows(c,rows,now);
+        out.fallback=phoneFallbackAlarms(rows);
+        JSONArray snoozes=s.optJSONArray("_watchSnoozes");
+        out.snoozes=snoozes==null?new JSONArray():new JSONArray(snoozes.toString());
+        out.selectionAlarms=new JSONArray(out.alarms.toString());
+        out.selectionActive=wearRows(c,rows,out.selectionAlarms,now);
+        out.fallbackProblem=out.accessProblem!=null?out.accessProblem:phoneFallbackProblem(s);
+        return out;
     }
     static synchronized void wearSetEnabled(Context c,long revision,long id,boolean enabled,long expiresAt) throws Exception {
         if(System.currentTimeMillis()>expiresAt) throw new IllegalArgumentException("Request expired; refresh on watch");
@@ -1304,14 +1348,16 @@ public final class AlarmStore {
     }
     static synchronized JSONArray active(Context c) {
         try {
-            JSONArray as=state(c).getJSONArray("alarms"), result=new JSONArray();
-            long now=System.currentTimeMillis();
-            for(int i=0;i<as.length();i++) {
-                JSONObject a=as.getJSONObject(i);
-                if(a.has("_active")&&validSession(c,a.getJSONObject("_active"),now)) result.put(a);
-            }
-            return result;
+            return activeRows(c,state(c).getJSONArray("alarms"),System.currentTimeMillis());
         } catch(JSONException e) { throw new IllegalStateException(e); }
+    }
+    private static JSONArray activeRows(Context c,JSONArray as,long now) throws JSONException {
+        JSONArray result=new JSONArray();
+        for(int i=0;i<as.length();i++) {
+            JSONObject a=as.getJSONObject(i);
+            if(a.has("_active")&&validSession(c,a.getJSONObject("_active"),now)) result.put(a);
+        }
+        return result;
     }
     static synchronized JSONObject active(Context c,long id,String token) {
         JSONArray as=active(c); JSONObject a=find(as,id);
@@ -1977,7 +2023,7 @@ public final class AlarmStore {
         Intent i=new Intent("com.openclock.REFRESH").setPackage(c.getPackageName()); c.sendBroadcast(i);
     }
     /** Preserve legacy local pending snoozes as visible one-shots, retaining their token. */
-    private static void migrateLegacyWatchSnoozes(Context c) throws Exception {
+    private static JSONObject migrateLegacyWatchSnoozes(Context c) throws Exception {
         JSONObject s=state(c); JSONArray rows=s.getJSONArray("alarms"); boolean changed=false;
         for(int i=0;i<rows.length();i++) {
             JSONObject a=rows.getJSONObject(i);
@@ -1999,6 +2045,7 @@ public final class AlarmStore {
                 .put("_watchOnlySnooze",true); changed=true;
         }
         if(changed) commit(c,s);
+        return s;
     }
     private static String legacyConsumed(JSONArray rows,String node,String epoch,long id) throws Exception {
         String found="";
@@ -2280,7 +2327,10 @@ public final class AlarmStore {
     }
     /** Scheduler-backed fallback presentation; never reconstruct schedules from the cache. */
     static synchronized JSONArray phoneFallbackAlarms(Context c) throws Exception {
-        JSONArray rows=state(c).getJSONArray("alarms"), result=new JSONArray();
+        return phoneFallbackAlarms(state(c).getJSONArray("alarms"));
+    }
+    private static JSONArray phoneFallbackAlarms(JSONArray rows) throws Exception {
+        JSONArray result=new JSONArray();
         for(int i=0;i<rows.length();i++) {
             JSONObject a=rows.getJSONObject(i);
             if(!a.optBoolean("_phoneFallback")) continue;
