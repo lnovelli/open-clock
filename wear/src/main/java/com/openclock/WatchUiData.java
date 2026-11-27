@@ -12,6 +12,7 @@ import java.util.List;
 final class WatchUiData {
     JSONObject phone = new JSONObject(), creation, mutation;
     JSONArray alarms = new JSONArray(), active = new JSONArray(), fallback = new JSONArray(), snoozes = new JSONArray();
+    List<JSONObject> orderedAlarms = new ArrayList<>();
     List<JSONObject> mirrors = new ArrayList<>();
     WatchSchedule.View schedule = new WatchSchedule.View();
     final java.util.Map<Long, List<JSONObject>> grouped = new java.util.HashMap<>();
@@ -62,6 +63,7 @@ final class WatchUiData {
           } finally { WatchUiTiming.phoneRead(Math.max(0, SystemClock.elapsedRealtime() - phoneStart - watchTime)); }
         }
         d.alarms = local.alarms; d.active = local.active;
+        d.orderedAlarms = AlarmListOrder.byTime(d.alarms);
         d.fallback = local.fallback; d.snoozes = local.snoozes;
         try { PhoneMirror.channels(c); } catch (RuntimeException unavailable) { /* Settings UI reports the channel state. */ }
         d.mirrors = PhoneMirror.live(c);
@@ -72,8 +74,7 @@ final class WatchUiData {
             JSONObject group = groups.optJSONObject(i);
             if (group != null && group.optLong("id", -1) > 0) d.grouped.put(group.optLong("id"), new ArrayList<>());
         }
-        for (int i = 0; i < d.schedule.phone.length(); i++) {
-            JSONObject row = d.schedule.phone.getJSONObject(i);
+        for (JSONObject row : AlarmListOrder.byTime(d.schedule.phone)) {
             List<JSONObject> group = row.isNull("groupId") ? null : d.grouped.get(row.optLong("groupId", -1));
             if (group == null) d.other.add(row); else group.add(row);
         }

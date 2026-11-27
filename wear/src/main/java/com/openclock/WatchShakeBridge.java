@@ -185,8 +185,14 @@ final class WatchShakeBridge implements SensorEventListener {
             // The selected session is only an admission anchor. PhoneMirror takes
             // mirror -> sync -> store locks and captures the entire live set at
             // one cutoff; it never broadens individual notification dismissals.
-            if ((detected.local && localService) || (!detected.local && mirrorService))
+            if ((detected.local && localService) || (!detected.local && mirrorService)) {
+                // Stop both output owners before taking store locks or doing disk I/O.
+                // If admission or commit fails, normal service reconciliation restores
+                // any still-active sessions rather than silently losing an alarm.
+                RingingService.silenceForShake();
+                PhoneMirrorService.silenceForShake();
                 PhoneMirror.dismissAllFromShake(app, detected.local, detected.id, detected.token);
+            }
         } catch (Exception failure) {
             Log.w(TAG, "Could not dismiss alarms from shake", failure);
             try { AlarmNotifications.warning(app, "Shake dismissal failed; use alarm controls."); }

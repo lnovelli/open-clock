@@ -335,6 +335,7 @@ public class MainActivity extends Activity {
             addBlock(body, note, 16);
         }
         JSONArray alarms = AlarmStore.alarms(this), groups = AlarmStore.groups(this);
+        java.util.List<JSONObject> orderedAlarms = AlarmListOrder.byTime(alarms);
         TextView overview = text(alarms.length() == 0 ? "A little peace of mind." : enabledCount(alarms) + " enabled · " + alarms.length() + " total", 14, MUTED);
         overview.setPadding(dp(4), dp(2), 0, dp(18));
         body.addView(overview);
@@ -343,8 +344,7 @@ public class MainActivity extends Activity {
             if (group == null) continue;
             long id = group.optLong("id");
             ArrayList<JSONObject> members = new ArrayList<>();
-            for (int j = 0; j < alarms.length(); j++) {
-                JSONObject a = alarms.optJSONObject(j);
+            for (JSONObject a : orderedAlarms) {
                 if (a != null && !a.isNull("groupId") && a.optLong("groupId") == id) members.add(a);
             }
             LinearLayout container = card(GROUP, 18);
@@ -390,9 +390,7 @@ public class MainActivity extends Activity {
         Set<Long> groupIds = new HashSet<>();
         for (int i = 0; i < groups.length(); i++) if (groups.optJSONObject(i) != null) groupIds.add(groups.optJSONObject(i).optLong("id"));
         boolean ungroupedHeading = false;
-        for (int i = 0; i < alarms.length(); i++) {
-            JSONObject alarm = alarms.optJSONObject(i);
-            if (alarm == null) continue;
+        for (JSONObject alarm : orderedAlarms) {
             if (!alarm.isNull("groupId") && groupIds.contains(alarm.optLong("groupId"))) continue;
             if (groups.length() > 0 && !ungroupedHeading) {
                 TextView heading = text("Other alarms", 15, MUTED);

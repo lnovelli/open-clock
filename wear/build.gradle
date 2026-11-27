@@ -7,8 +7,8 @@ android {
         applicationId 'com.openclock'
         minSdk 26
         targetSdk 34
-        versionCode 38
-        versionName '2.15'
+        versionCode 39
+        versionName '2.16'
     }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     buildTypes { release { minifyEnabled false } }
@@ -26,7 +26,8 @@ tasks.register('prepareWatchEngine', Sync) {
                 'com/openclock/ClockApplication.java', 'com/openclock/AlarmConfirmation.java',
                 'com/openclock/UpdateChecker.java', 'com/openclock/GenericDismissProtocol.java',
                 'com/openclock/AlarmOutputIcons.java', 'com/openclock/SnoozeProtocol.java',
-                'com/openclock/AlarmIdentity.java', 'com/openclock/AlarmV2.java'
+                'com/openclock/AlarmIdentity.java', 'com/openclock/AlarmV2.java',
+                'com/openclock/AlarmListOrder.java'
         into 'java'
     }
     from('../app/src/main/res') {

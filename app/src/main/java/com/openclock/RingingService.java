@@ -10,6 +10,7 @@ import java.util.*;
 
 /** A bounded foreground lifecycle, supporting simultaneous independent alarm sessions. */
 public final class RingingService extends Service {
+    private static RingingService instance;
     private final Handler handler=new Handler(Looper.getMainLooper());
     private MediaPlayer player;
     private Vibrator vibrator;
@@ -28,6 +29,7 @@ public final class RingingService extends Service {
     private final BroadcastReceiver refresh=new BroadcastReceiver() { public void onReceive(Context c,Intent i) { reconcile(); } };
     @Override public void onCreate() {
         super.onCreate(); AlarmNotifications.channels(this);
+        instance=this;
         if(Build.VERSION.SDK_INT>=33) registerReceiver(refresh,new IntentFilter("com.openclock.REFRESH"),Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(refresh,new IntentFilter("com.openclock.REFRESH"));
         audio=getSystemService(AudioManager.class); vibrator=getSystemService(Vibrator.class);
@@ -150,7 +152,16 @@ public final class RingingService extends Service {
         if(player!=null) { player.release(); player=null; }
         if(focus!=null&&audio!=null) { audio.abandonAudioFocusRequest(focus); focus=null; }
     }
+    // Called on the main looper by the Wear gesture before any dismissal I/O.
+    static void silenceForShake() {
+        RingingService service=instance;
+        if(service==null) return;
+        service.stopAudio();
+        if(service.vibrator!=null) service.vibrator.cancel();
+        service.vibrating=false; service.vibratingPattern="";
+    }
     @Override public void onDestroy() {
+        if(instance==this) instance=null;
         WatchShakeBridge.local(this,false);
         handler.removeCallbacksAndMessages(null); unregisterReceiver(refresh); stopAudio();
         if(vibrator!=null) vibrator.cancel(); if(wake!=null&&wake.isHeld()) wake.release();

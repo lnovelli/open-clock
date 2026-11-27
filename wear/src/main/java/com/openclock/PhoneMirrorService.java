@@ -23,6 +23,7 @@ import java.util.List;
 
 /** Best-effort, time-bounded phone mirror; independent of watch alarm sessions. */
 public final class PhoneMirrorService extends Service {
+    private static PhoneMirrorService instance;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable tick = this::reconcile;
     private MediaPlayer player;
@@ -37,6 +38,7 @@ public final class PhoneMirrorService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        instance = this;
         audio = getSystemService(AudioManager.class);
         vibrator = getSystemService(Vibrator.class);
         wake = getSystemService(PowerManager.class).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpenClock:phone-mirror");
@@ -167,7 +169,17 @@ public final class PhoneMirrorService extends Service {
         if (!localVibrating && vibrator != null) vibrator.cancel();
         vibrating = false;
     }
+    // The gesture silences both services together, so app-scoped cancellation is safe.
+    static void silenceForShake() {
+        PhoneMirrorService service = instance;
+        if (service == null) return;
+        service.stopAudio();
+        if (service.vibrator != null) service.vibrator.cancel();
+        service.vibrating = false;
+        service.nextVibration = 0;
+    }
     @Override public void onDestroy() {
+        if (instance == this) instance = null;
         WatchShakeBridge.mirror(this, false);
         handler.removeCallbacksAndMessages(null); stopAudio();
         if (vibrating) cancelVibration();

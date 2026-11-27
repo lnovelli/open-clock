@@ -545,9 +545,7 @@ public class MainActivity extends Activity {
         try {
             JSONArray alarms = data.alarms;
             if (alarms.length() == 0) note("No watch alarms yet");
-            for (int i = 0; i < alarms.length(); i++) {
-                JSONObject a = alarms.optJSONObject(i); if (a != null) add(alarmRow(a, false), 8);
-            }
+            for (JSONObject a : data.orderedAlarms) add(alarmRow(a, false), 8);
         } catch (Exception e) { note("Watch alarms unavailable: " + AlarmStore.message(e)); }
         add(button("+  Add on watch", 0xff3d465d, () -> beginCreate(false)), 10);
         section("Phone alarms");
